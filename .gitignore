@@ -1,0 +1,9 @@
+# Build artifacts
+/build/
+
+# OS/editor
+.DS_Store
+*.swp
+
+# Claude session files
+.claude/
