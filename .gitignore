@@ -1,5 +1,11 @@
 # Build artifacts
 /build/
+*.i
+*.ii
+*.gpu
+*.ptx
+*.cubin
+*.fatbin
 
 # OS/editor
 .DS_Store
