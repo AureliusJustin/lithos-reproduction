@@ -30,7 +30,8 @@ Legend: ✅ faithful · ≈ divergent (same goal, different mechanism) · ◑ si
 | When atomization is applied | at launch (patch the live QMD) | at **module load** (ELF surgery on the cubin) | ≈ |
 | Per-atom metadata delivery | Prelude gets an `AtomMetadata` struct; **mechanism not specified** | shared device buffer written per launch (`cuMemsetD32Async`) + event serialization | ? |
 | Atom sizing | target duration 250–500 µs | same knob (`LITHOS_ATOM_US`), fed by the stub predictor | ◑ |
-| CUDA Graphs | "interpose graph creation APIs and atomize graphs into subgraphs" | **stream-capture only** (atoms recorded as nodes); explicit `cuGraphAddKernelNode` not interposed | ◑ |
+| CUDA Graphs | "interpose graph creation APIs and atomize graphs into subgraphs, ensuring correct execution ordering" | **both** interpretations: (a) atomize kernels into an in-graph subgraph (default, correct but schedule frozen); (b) `LITHOS_GRAPH_SUBGRAPHS=K` partitions the graph into K subgraphs along a topological cut, each independently TPC-allocated (the paper's likely intent) | ✅≈ |
+| Graph replay rescheduling | (unspecified) | TPC mask **cannot** change on replay — QMD pre-upload callback fires once/exec; reallocation needs re-instantiation (subgraph granularity makes it cheap) | ? |
 | Hopper Thread Block Clusters | atoms are multiples of cluster size | cluster launches detected and **not split** (no cluster-multiple sizing) | ◑ |
 | Special (cross-block-sync/persistent) kernels | disable stealing+atomization; report allocated SM count via `cuDeviceGetAttribute` | cooperative/cluster launches not split; **`cuDeviceGetAttribute` not adjusted**; non-cooperative cross-block-sync undetectable | ◑ |
 | Multi-tenant coordination | central scheduler assigns resources across tenants | **per-process**; `LITHOS_TPC_BASE` gives manual disjoint ranges (no central coordinator) | ◑ |
@@ -100,8 +101,11 @@ program-address redirect. It is functionally the same per-block gate (Algorithm
   same QMD mask.
 - **Atomization semantics** — a per-block range gate that runs the original for
   in-range blocks and skips the rest, dispatched as N per-atom full-grid launches.
-- **CUDA Graphs** are atomized into subgraphs on stream capture (the paper's
-  intent, if not its full API surface).
+- **CUDA Graphs** — two modes: atomize kernels into an in-graph subgraph on stream
+  capture; or `LITHOS_GRAPH_SUBGRAPHS=K` partitions the graph into K subgraphs
+  (topological cut) for per-subgraph TPC scheduling with runtime re-instantiation
+  (the paper's likely intent). The subgraph mode works on any instantiated graph
+  (captured or built), since it partitions at `cuGraphInstantiate`.
 - **Building on MPS** for concurrent multi-tenant execution.
 
 ---
@@ -135,8 +139,11 @@ program-address redirect. It is functionally the same per-block gate (Algorithm
 - **`cuDeviceGetAttribute` spoofing** of `MULTIPROCESSOR_COUNT` for
   cross-block-sync kernels (the paper returns the allocated SM count so such
   kernels size themselves to their partition).
-- **Explicit CUDA-graph construction API** interposition
-  (`cuGraphAddKernelNode`); only stream capture is handled.
+- **Explicit CUDA-graph construction API** interposition — the *atomize-in-graph*
+  mode only sees stream capture (it intercepts `cuLaunchKernel`), so manually-built
+  graphs (`cuGraphAddKernelNode`) aren't atomized. (The *subgraph* mode does handle
+  them — it partitions at `cuGraphInstantiate`, independent of how the graph was
+  built.)
 - **Container-specific** integration (untested).
 
 ---

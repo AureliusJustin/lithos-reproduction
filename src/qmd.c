@@ -24,6 +24,8 @@ int g_qmd_prog_addr_off = 0;
 static int g_qmd_ntpc = 64;
 /* Thread-local arming state */
 static __thread uint64_t t_next_mask   = 0;
+static __thread uint64_t t_sticky_mask = 0;   /* applied to every upload until cleared */
+static __thread int      t_sticky      = 0;
 static __thread int      t_capture     = 0;
 static __thread uint64_t t_captured    = 0;
 static __thread int      t_atomize     = 0;
@@ -44,6 +46,10 @@ static void control_callback(void* ukwn, int domain, int cbid, const void* in_pa
         return;
     void* tmd = *((void**)in_params + 4);
     if (!tmd) return;
+    if (getenv("LITHOS_LOG_CB")) {   /* count EVERY pre-upload callback (any mask or not) */
+        static int cbn = 0;
+        fprintf(stderr, "[cb] pre-upload callback #%d (tmd=%p)\n", ++cbn, tmd);
+    }
 
     uint8_t tmd_ver = *(uint8_t*)((char*)tmd + 72);
     uint32_t *lower_ptr = NULL, *upper_ptr = NULL, *ext_lo = NULL, *ext_hi = NULL;
@@ -59,18 +65,26 @@ static void control_callback(void* ukwn, int domain, int cbid, const void* in_pa
         upper_ptr = (uint32_t*)((char*)tmd + 88);
     }
 
-    /* --- TPC mask (scheduler / stealing) --- */
-    if (lower_ptr && t_next_mask) {
-        *lower_ptr = (uint32_t)t_next_mask;
-        *upper_ptr = (uint32_t)(t_next_mask >> 32);
-        if (getenv("LITHOS_LOG_MASK")) {   /* observe the per-launch TPC allocation */
-            char en[256]; int p = 0;
-            for (int t = 0; t < g_qmd_ntpc && p < 240; t++)
-                if (!((t_next_mask >> t) & 1)) p += snprintf(en+p, sizeof(en)-p, "%d,", t);
-            fprintf(stderr, "[mask] disable=0x%016llx enabled_TPCs=[%s]\n",
-                    (unsigned long long)t_next_mask, en);
+    /* --- TPC mask (scheduler / stealing / graph subgraphs) ---
+       t_next_mask is one-shot (consumed per launch: normal eager scheduling).
+       t_sticky is a mask that applies to EVERY upload until cleared: used when
+       launching a subgraph whose (possibly several) kernel nodes must all land on
+       the same scheduler-assigned TPC set. */
+    if (lower_ptr) {
+        uint64_t mm = 0; int have = 0;
+        if (t_next_mask)   { mm = t_next_mask; t_next_mask = 0; have = 1; }
+        else if (t_sticky) { mm = t_sticky_mask;                have = 1; }
+        if (have) {
+            *lower_ptr = (uint32_t)mm;
+            *upper_ptr = (uint32_t)(mm >> 32);
+            if (getenv("LITHOS_LOG_MASK")) {   /* observe the applied TPC allocation */
+                char en[256]; int p = 0;
+                for (int t = 0; t < g_qmd_ntpc && p < 240; t++)
+                    if (!((mm >> t) & 1)) p += snprintf(en+p, sizeof(en)-p, "%d,", t);
+                fprintf(stderr, "[mask]%s disable=0x%016llx enabled_TPCs=[%s]\n",
+                        t_sticky ? "(sticky)" : "", (unsigned long long)mm, en);
+            }
         }
-        t_next_mask = 0;
     }
 
     /* --- Dump for reverse-engineering --- */
@@ -147,6 +161,8 @@ void qmd_init(void) {
 
 void qmd_set_next_mask(uint64_t m) { t_next_mask = m; }
 void qmd_set_num_tpcs(int n) { if (n > 0 && n <= 64) g_qmd_ntpc = n; }
+void qmd_set_sticky_mask(uint64_t m) { t_sticky_mask = m; t_sticky = 1; }
+void qmd_clear_sticky_mask(void) { t_sticky = 0; t_sticky_mask = 0; }
 void qmd_arm_capture(void) { t_capture = 1; t_captured = 0; }
 uint64_t qmd_get_captured(void) { return t_captured; }
 void qmd_get_captured_qmd(void* out256) { memcpy(out256, t_captured_qmd, 256); }

@@ -79,6 +79,7 @@ typedef struct LithosConfig {
     int      atom_tpc_width;        /* LITHOS_ATOM_TPC: distinct W-TPC slice per atom (0=off) */
     int      atom_tpc_list[64];     /* LITHOS_ATOM_TPC_LIST: per-atom TPC widths (cycled) */
     int      atom_tpc_list_n;       /* number of entries in atom_tpc_list (0=off)        */
+    int      graph_subgraphs;       /* LITHOS_GRAPH_SUBGRAPHS: partition graphs into K subgraphs (0=off) */
     int      enable_stealing;
     int      enable_jump;         /* attempt the Prelude->original transfer      */
     int      use_brx;             /* 1 = patch CALL->BRX jump; 0 = keep the CALL  */
@@ -97,6 +98,16 @@ uint64_t lithos_now_ns(void);        /* monotonic clock helper               */
  * re-applies the stream's quota mask to every atom (the QMD mask is one-shot per
  * launch, so without this only the first atom would be confined). */
 void lithos_apply_atom_mask(void* stream, int atom_idx, int n_atoms);
+
+/* Compute (not apply) the TPC disable-mask for slice idx of n on this stream. */
+uint64_t lithos_slice_mask(void* stream, int idx, int n);
+
+/* Paper-model CUDA-graph scheduling (src/graphsched.c): partition an instantiated
+ * graph into K subgraphs so the scheduler can allocate TPCs per subgraph. Returns
+ * 1 and fills the interception if handled, 0 to fall back to the real call. */
+int lithos_graph_instantiate(void* pExec, void* graph, unsigned long long flags);
+int lithos_graph_launch(void* exec, void* stream);
+int lithos_graph_exec_destroy(void* exec);
 
 #ifdef __cplusplus
 }

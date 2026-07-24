@@ -177,9 +177,13 @@ static uint64_t compute_disable_mask(StreamState* st, uint64_t now) {
  *    adjustment.
  *  - otherwise          : re-apply the stream's quota mask to EVERY atom, so a
  *    quota confines all atoms (not just the first). */
-void lithos_apply_atom_mask(void* stream, int atom_idx, int n_atoms) {
-    (void)n_atoms;
-    if (g_num_tpcs == 0) return;
+/* Compute (but do not apply) the TPC disable-mask for slice `idx` of `n` on this
+ * stream. Shared by per-atom masking (eager) and per-subgraph masking (graphs):
+ * LITHOS_ATOM_TPC_LIST / LITHOS_ATOM_TPC give slice idx a distinct TPC set tiled
+ * across the stream's span; else the stream's quota mask. Returns 0 = unrestricted. */
+uint64_t lithos_slice_mask(void* stream, int idx, int n) {
+    (void)n;
+    if (g_num_tpcs == 0) return 0;
     int w = g_lithos_cfg.atom_tpc_width;
     int nlist = g_lithos_cfg.atom_tpc_list_n;
     uint64_t dmask = 0;
@@ -188,32 +192,34 @@ void lithos_apply_atom_mask(void* stream, int atom_idx, int n_atoms) {
     int span_lo = 0, span = (int)g_num_tpcs;
     if (st && st->quota_tpcs > 0) { span_lo = st->tpc_lo; span = st->tpc_hi - st->tpc_lo; }
     if (span < 1) span = 1;
+    uint64_t all = (g_num_tpcs >= 64) ? ~0ull : ((1ull << g_num_tpcs) - 1);
     if (nlist > 0) {
-        /* variable per-atom widths: atom i gets list[i%nlist] TPCs, packed
-           contiguously (cumulative start offset), wrapping within the span. */
-        int aw = g_lithos_cfg.atom_tpc_list[atom_idx % nlist];
+        int aw = g_lithos_cfg.atom_tpc_list[idx % nlist];
         if (aw < 1) aw = 1;
         long off = 0;
-        for (int j = 0; j < atom_idx; j++) off += g_lithos_cfg.atom_tpc_list[j % nlist];
+        for (int j = 0; j < idx; j++) off += g_lithos_cfg.atom_tpc_list[j % nlist];
         uint64_t enable = 0;
         for (int t = 0; t < aw; t++) {
             int tp = span_lo + (int)((off + t) % span);
             if (tp < 64) enable |= (1ull << tp);
         }
-        uint64_t all = (g_num_tpcs >= 64) ? ~0ull : ((1ull << g_num_tpcs) - 1);
         dmask = (~enable) & all;
     } else if (w > 0) {
         uint64_t enable = 0;
         for (int t = 0; t < w; t++) {
-            int tp = span_lo + (((atom_idx * w) + t) % span);
+            int tp = span_lo + (((idx * w) + t) % span);
             if (tp < 64) enable |= (1ull << tp);
         }
-        uint64_t all = (g_num_tpcs >= 64) ? ~0ull : ((1ull << g_num_tpcs) - 1);
         dmask = (~enable) & all;
     } else if (st) {
         dmask = compute_disable_mask(st, lithos_now_ns());
     }
     pthread_mutex_unlock(&g_lock);
+    return dmask;
+}
+
+void lithos_apply_atom_mask(void* stream, int atom_idx, int n_atoms) {
+    uint64_t dmask = lithos_slice_mask(stream, atom_idx, n_atoms);
     if (dmask) qmd_set_next_mask(dmask);
 }
 

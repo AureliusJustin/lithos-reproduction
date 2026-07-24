@@ -287,6 +287,7 @@ static int is_full_func(CUfunction f) {
  * clamped to [1, blocks]. pred_us is stubbed proportional to the block count. */
 static int decide_atoms(uint64_t blocks) {
     if (!g_lithos_cfg.enable_atomizer) return 1;
+    if (g_lithos_cfg.graph_subgraphs > 1) return 1;  /* graphs: subgraph is the unit, kernels run whole */
     if (g_lithos_cfg.force_atoms > 0) {   /* explicit override (testing/policy) */
         int n = g_lithos_cfg.force_atoms;
         return (uint64_t)n > blocks ? (int)blocks : n;

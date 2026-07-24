@@ -54,7 +54,7 @@ All behaviour is controlled through environment variables — see
 [Configuration](#configuration-environment-variables) for the full list.
 
 > 📄 **Full technical report:** [docs/TECHNICAL_REPORT.md](docs/TECHNICAL_REPORT.md) — every module, how they work together, the reverse-engineering findings, and the framework validation.
-> 📊 **Latency microbenchmark:** [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — interposition ~0.35 µs/launch, atomizer ~4 µs/launch (and why), MPS ≈ free, plus module-load and gating-scan costs.
+> 📊 **Latency microbenchmark:** [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — interposition ~0.35 µs/launch, atomizer ~4 µs/launch (and why), MPS ≈ free, module-load and gating-scan costs, plus a full **CUDA-graph overhead** profile (atomize-in-graph +120 %+ vs subgraph model single-digit %, and ~8 µs/subgraph reallocation).
 > 🔍 **Fidelity vs. the paper:** [docs/FIDELITY.md](docs/FIDELITY.md) — what's faithful, what diverges (the atomizer transfer), what's simplified/stubbed, what's not implemented, and what the paper leaves unspecified.
 
 ## Hardware requirements
@@ -377,16 +377,44 @@ gated (splice-skipped, or a handle we couldn't match) is launched with a
 serialized **full range** so it can never read a stale `[lo,hi]` and drop blocks.
 This took JAX/XLA (heavily multi-stream) from 2/10 to **10/10** correct.
 
-**CUDA Graphs** (§6 "Special Kernels" — atomize graphs into subgraphs). During
-stream capture, our per-atom `[set-range → relaunch]` sequence is *recorded* as
-graph nodes, so a captured kernel becomes an atomized **subgraph** that replays
-correctly. The atom ranges are written with **`cuMemsetD32Async`** (not a
-host→device copy): the immediate values bake into the graph nodes, so replay
-reproduces each atom's range — and, unlike a tiny async copy, a memset node never
-runs synchronously (which would invalidate capture). As with all CUDA-graph code,
-the app must **warm up** before capturing (so module loads / one-time init finish
-outside the capture region). Verified: `build/test_atomize_graph` and PyTorch
-`torch.cuda.CUDAGraph` both capture → atomized subgraph → correct on replay.
+**CUDA Graphs** (§6 — "atomize graphs into subgraphs, ensuring correct execution
+ordering"). There are **two modes**, because a key hardware fact constrains what's
+possible: the QMD **pre-upload callback fires exactly once per graph exec** (at the
+first `cuGraphLaunch`); replays re-run a compiled command buffer that bypasses the
+driver's per-node path, so the SM-mask **cannot be changed on replay** — only by
+**re-instantiating** (which re-fires the callback, verified).
+
+- **(default) atomize-into-graph.** During capture, our per-atom `[set-range →
+  relaunch]` sequence is recorded as nodes, so a captured kernel becomes an
+  atomized **subgraph** that replays correctly (ranges bake into `cuMemsetD32Async`
+  immediates). Results are correct and replay reproduces each atom's range, but the
+  schedule is **frozen**: atom ranges are baked and per-atom TPC masks don't apply
+  in a graph (the one-shot mask can't map onto N nodes). Good for correctness +
+  launch-bypass, not for dynamic rescheduling. Verified: `build/test_atomize_graph`
+  and PyTorch `torch.cuda.CUDAGraph`.
+- **(`LITHOS_GRAPH_SUBGRAPHS=K`) partition-into-subgraphs — the paper's model.**
+  Don't atomize kernels. At instantiate, partition the graph along a **topological
+  cut** into K subgraphs ([`src/graphsched.c`](src/graphsched.c), via
+  `cuGraphClone` + node deletion); at launch, fan the single `cuGraphLaunch` into K
+  sequential subgraph launches on the stream (order ⇒ dependencies), applying the
+  scheduler's TPC allocation as a **sticky mask** before each subgraph (covers all
+  its kernel nodes). The **subgraph is the scheduling/reallocation unit**; kernels
+  run whole; most launch-bypass is retained (K launches, K ≪ #kernels).
+  Verified: an 8-kernel chain → 4 subgraphs, each confined to a distinct 2-TPC
+  slice (`{0,1}{2,3}{4,5}{6,7}`), every kernel used exactly its 4 SMs, output
+  bit-identical to baseline.
+  - **Runtime reallocation.** The subgraph *templates* are kept, so on each
+    `cuGraphLaunch` LithOS compares each subgraph's desired allocation to what's
+    currently baked and **re-instantiates only the subgraphs whose allocation
+    changed** (a fresh exec re-fires the callback, baking the new mask); unchanged
+    subgraphs just replay. So the *same* app-level graph exec can run on a
+    *different* TPC allocation each replay, transparently. Demonstrated with
+    `LITHOS_SUBGRAPH_ROTATE=1` (rotates the allocation per replay): the 4 subgraphs
+    move through `{0,1}{2,3}{4,5}{6,7}` → `{2,3}{4,5}{6,7}{0,1}` → … with output
+    still correct on every replay. Cost (8-kernel chain): steady replay ≈ 16 µs
+    (vs 12 µs baseline, the fan-out); a reallocating replay ≈ 49 µs (≈ 8 µs per
+    re-instantiated subgraph) — paid only when the allocation actually changes, and
+    only for the subgraphs that changed.
 
 **Verified on this A6000** (`LD_LIBRARY_PATH=build python3 …`):
 
@@ -424,7 +452,10 @@ atomizer / scheduler / CUDA graphs / end-to-end — passes for all of them.
 | `LITHOS_QUOTA` | −1 | per-stream TPC quota (compute quotas) |
 | `LITHOS_STEALING` | 1 | enable TPC stealing from idle streams |
 | `LITHOS_TPC_BASE` | 0 | first TPC of this process's range (give concurrent processes disjoint ranges under MPS) |
-| `LITHOS_LOG_MASK` | 0 | log the TPC disable-mask (and enabled-TPC list) applied to each launch — useful to observe per-atom allocation |
+| `LITHOS_GRAPH_SUBGRAPHS` | 0 | **paper-model graph scheduling**: partition each instantiated CUDA graph into K subgraphs (topological cut) and give each subgraph its own TPC allocation, instead of atomizing kernels inside the graph. Kernels run whole; the subgraph is the scheduling unit. Reallocates on replay by re-instantiating only the changed subgraphs |
+| `LITHOS_SUBGRAPH_ROTATE` | 0 | demo: rotate each subgraph's TPC allocation every replay (stands in for a live scheduler changing allocations), which exercises the runtime re-instantiation path |
+| `LITHOS_LOG_MASK` | 0 | log the TPC disable-mask (and enabled-TPC list) applied to each launch — useful to observe per-atom/per-subgraph allocation |
+| `LITHOS_LOG_CB` / `LITHOS_LOG_GRAPH` | 0 | log every QMD pre-upload callback / graph-partition decision |
 | `LITHOS_OUTSTANDING_US` | 100 | outstanding-work throttle threshold |
 
 ## Reverse-engineering probes

@@ -66,10 +66,13 @@ functionally identical, no control transfer.
 │                                                                              │
 │ atomizer.c    Kernel Atomizer: module-load splice, per-launch atom split,    │
 │ atomize_splice.c   the ELF/SASS surgery that injects the range-check         │
-│ fatbin.c           fatbin/PTX → cubin unwrapping (LZ4, JIT)                   │
+│ fatbin.c           fatbin/PTX → cubin unwrapping (LZ4/Zstd, JIT)             │
+│                                                                              │
+│ graphsched.c  CUDA-graph subgraph scheduling: partition a graph into K       │
+│               subgraphs, per-subgraph TPC allocation, runtime re-instantiate │
 │                                                                              │
 │ qmd.c         QMD pre-upload hook (libsmctrl-style): applies the TPC mask    │
-│               to every launch, below the launch API                          │
+│               (one-shot or sticky) to every launch, below the launch API     │
 │                                                                              │
 │ real.c        resolves the genuine driver entry points                       │
 │ config.c      environment-variable configuration                             │
@@ -382,6 +385,41 @@ buffer). Two safeguards:
   read another atom's stale `[lo,hi]` and drop blocks.
 
 Together these took JAX/XLA (heavily multi-stream) from 2/10 to **10/10** correct.
+
+### 5.6 CUDA graphs: two modes and the replay constraint
+
+A hardware fact shapes everything here: the QMD **pre-upload callback fires exactly
+once per graph exec** — at the first `cuGraphLaunch`. Replays re-run a compiled
+command buffer that bypasses the driver's per-node path, so the SM/TPC mask (which
+`qmd.c` writes *in* that callback) **cannot be changed on replay**; only
+**re-instantiating** the exec re-fires it. Verified with an unconditional callback
+counter (`LITHOS_LOG_CB`): 1 firing across instantiate + N replays; destroy +
+re-instantiate → the callback fires again. Two modes follow:
+
+1. **Atomize-in-graph (default).** During capture the atomizer records each
+   kernel's `[set-range → relaunch]` atoms as graph nodes (§5.4). Correct and
+   replay-stable (ranges bake into the memset immediates), but the schedule is
+   **frozen**: atom ranges are baked, and per-atom TPC masks don't apply (the
+   one-shot mask can't map onto N nodes). It's also **expensive on graphs** — even
+   at n=1 it adds two metadata `memset` nodes per kernel (+120 % replay; see
+   [BENCHMARKS](BENCHMARKS.md)).
+2. **Partition-into-subgraphs (`LITHOS_GRAPH_SUBGRAPHS=K`,
+   [`src/graphsched.c`](../src/graphsched.c)) — the paper's model.** Kernels are
+   *not* atomized. At `cuGraphInstantiate` the graph is partitioned along a
+   **topological cut** (Kahn sort of `cuGraphGetNodes`/`GetEdges`; each subgraph
+   built by `cuGraphClone` + deleting non-chunk nodes). At `cuGraphLaunch` the
+   single app launch is fanned into K sequential subgraph launches on the stream
+   (order ⇒ dependencies), each preceded by the scheduler's TPC allocation applied
+   as a **sticky mask** (`qmd_set_sticky_mask`, so *all* kernel nodes of a subgraph
+   share it — the one-shot mask would only cover the first). The subgraph is the
+   scheduling unit; launch-bypass is retained (K ≪ #kernels).
+   - **Runtime reallocation.** Subgraph *templates* (`CUgraph`) are kept, and per
+     `cuGraphLaunch` each subgraph whose desired allocation changed is
+     **re-instantiated from its template** (a fresh exec re-bakes the new mask);
+     unchanged subgraphs just replay. So the same app-level graph exec runs on a
+     different TPC allocation each replay — cost ~7–14 µs per *changed* subgraph
+     (see BENCHMARKS), paid only on change. `cuGraphExecUpdate` can't do this (the
+     SM mask isn't a graph-API param), which is why re-instantiation is the path.
 
 ---
 

@@ -39,6 +39,7 @@ static void cfg_init_once(void) {
         }
         g_lithos_cfg.atom_tpc_list_n = n;
     }
+    g_lithos_cfg.graph_subgraphs = envi("LITHOS_GRAPH_SUBGRAPHS", 0);
     g_lithos_cfg.enable_stealing       = envi("LITHOS_STEALING", 1);
     /* The transparent Prelude redirect is proven, but the Prelude->original
      * tail-transfer needs a compiler-emitted JUMP (see docs); gated off so the

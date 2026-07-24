@@ -28,6 +28,12 @@ void qmd_set_next_mask(uint64_t disable_mask);
 /* Tell the QMD layer the valid TPC count (for clean LITHOS_LOG_MASK output). */
 void qmd_set_num_tpcs(int n);
 
+/* Sticky TPC mask: applied to EVERY QMD upload until cleared (not one-shot).
+ * Used to confine all kernel nodes of one subgraph to a scheduler-assigned TPC
+ * set during that subgraph's (first) graph launch. */
+void qmd_set_sticky_mask(uint64_t disable_mask);
+void qmd_clear_sticky_mask(void);
+
 /* Arm capture of the next launch. After the launch call returns, read the
  * program-address VA with qmd_get_captured() and the full QMD (256 bytes) with
  * qmd_get_captured_qmd(). */

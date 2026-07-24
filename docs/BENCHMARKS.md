@@ -75,3 +75,74 @@ scan the prefetcher hides, so **not** a linear blow-up even at TensorRT-scale
   kernels. How the original delivers per-atom metadata (and thus whether it has a
   similar cost) is not stated in the paper.
 - Nothing scales badly with kernel count or MPS.
+
+---
+
+## CUDA graph overhead
+
+Graphs are the interesting case because the QMD **pre-upload callback fires exactly
+once per graph exec** (at the first `cuGraphLaunch`); replays re-run a compiled
+command buffer that bypasses the driver's per-node path, so the SM mask **cannot be
+changed on replay** — only by **re-instantiating** (which re-fires the callback).
+That fact drives the two graph modes and their very different costs.
+
+Harness: a chain of compute kernels captured into a graph; steady replay is a
+best-of-3 median (structural overheads); the reallocation cost is measured in
+isolation (host-side, so it's independent of the GPU boost-clock variance that
+otherwise swamps per-replay deltas across processes). **Every mode below produced
+the correct checksum** — atomization/partitioning never changes graph results.
+
+### Steady-state per-replay overhead
+
+| mode | 8-kernel chain | 32-kernel chain | cost source |
+|---|---|---|---|
+| baseline (no LithOS) | — | — | 1 `cuGraphLaunch` |
+| interpose only | **+2 %** | **+2 %** | wrapper passthrough |
+| **atomize-in-graph (default, n=1)** | **+120 %** | **+194 %** | **2 memset (metadata) nodes per kernel** triple the node count, + spliced prologue per kernel |
+| atomize-in-graph (4 atoms) | +651 % | +1081 % | each kernel → 4 atom-launches + 8 memset nodes; replay runs N× the nodes |
+| **subgraph K=2** (paper model) | +7 % | −3 % | fan-out: 2 graph launches vs 1 |
+| subgraph K=4 | +13 % | ~0 % | 4 launches |
+| subgraph K=8 | +20 % | +8 % | 8 launches |
+
+**The default "atomize-into-graph" mode is the wrong tool for graphs:** even at
+n=1 (no splitting) it adds two `cuMemsetD32Async` metadata nodes per kernel — the
+in-graph metadata delivery that's cheap for eager launches becomes a tripled node
+count and a serialized memset before every kernel. Splitting into atoms multiplies
+nodes and blows the replay up 6–11×. The **subgraph model is nearly free**
+(single-digit %), and on a larger graph (32 kernels) it amortizes to ≈ baseline.
+
+### One-time costs (paid once, not per replay)
+
+| mode | capture | instantiate / partition |
+|---|---|---|
+| baseline | ~0.17 ms | 0.07 ms |
+| subgraph K=4 | ~0.16 ms | 0.13 ms (**+0.06 ms**: 4× clone + delete + instantiate) |
+| subgraph K=8 | ~0.16 ms | 0.15 ms (+0.08 ms) |
+| atomize-in-graph (4 atoms) | ~0.10 ms | 0.32 ms (more nodes to compile) |
+
+Partitioning adds a one-time ~0.06–0.08 ms at instantiate — negligible against a
+graph that replays thousands of times.
+
+### Reallocation cost (isolated host cost of re-instantiating one subgraph)
+
+| subgraph size | instantiate+destroy |
+|---|---|
+| 2 nodes | **7.3 µs** |
+| 4 nodes | 9.9 µs |
+| 8 nodes | 14.1 µs |
+
+Reallocation costs **~7–14 µs per *changed* subgraph**, and only changed subgraphs
+rebuild — steady replays do zero. Rotating all 4 subgraphs every replay (worst
+case) added `4 × 7.3 ≈ 29 µs`. This is exactly why partitioning matters: a
+reallocation rebuilds a 2-node template, not the whole graph.
+
+### Graph takeaways
+
+- **Interposition on graphs is free (+2 %).**
+- **Prefer `LITHOS_GRAPH_SUBGRAPHS` over in-graph atomization for graph-heavy
+  workloads** — the per-kernel metadata nodes alone add +120 %+, before any split.
+- **The subgraph model is cheap** (single-digit %, amortizing to ~0 on larger
+  graphs) and delivers real per-subgraph TPC scheduling.
+- **Dynamic reallocation is ~8 µs per changed subgraph**, paid only on change — the
+  subgraph granularity is what makes rescheduling-at-replay affordable.
+- **Correctness holds in every mode and size.**

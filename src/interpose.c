@@ -311,6 +311,58 @@ CUresult cuCtxSynchronize(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/*  CUDA graph subgraph-scheduling interception (LITHOS_GRAPH_SUBGRAPHS)*/
+/* ------------------------------------------------------------------ */
+/* cuda.h version-mangles these (e.g. cuGraphInstantiate -> cuGraphInstantiateWithFlags,
+ * cuGraphLaunch -> __CUDA_API_PTSZ(...)); undo so we can define each ABI by name. */
+#undef cuGraphInstantiate
+#undef cuGraphInstantiateWithFlags
+#undef cuGraphLaunch
+#undef cuGraphExecDestroy
+/* Real graph entry points, resolved lazily (we forward when subgraph mode is off
+ * or an exec isn't one we partitioned). */
+static CUresult (*rg_instantiate)(CUgraphExec*, CUgraph, unsigned long long);
+static CUresult (*rg_instantiate_v2)(CUgraphExec*, CUgraph, CUgraphNode*, char*, size_t);
+static CUresult (*rg_launch)(CUgraphExec, CUstream);
+static CUresult (*rg_exec_destroy)(CUgraphExec);
+static void graph_resolve(void) {
+    if (rg_launch) return;
+    rg_instantiate    = (typeof(rg_instantiate))lithos_real_sym("cuGraphInstantiateWithFlags");
+    rg_instantiate_v2 = (typeof(rg_instantiate_v2))lithos_real_sym("cuGraphInstantiate_v2");
+    rg_launch         = (typeof(rg_launch))lithos_real_sym("cuGraphLaunch");
+    rg_exec_destroy   = (typeof(rg_exec_destroy))lithos_real_sym("cuGraphExecDestroy");
+}
+
+CUresult cuGraphInstantiateWithFlags(CUgraphExec* pExec, CUgraph graph, unsigned long long flags) {
+    ensure_init(); graph_resolve();
+    if (lithos_graph_instantiate(pExec, graph, flags)) return CUDA_SUCCESS;
+    return rg_instantiate(pExec, graph, flags);
+}
+/* cuGraphInstantiate (the base name) maps to different ABIs across CUDA versions;
+ * cover the two we see: the flags form and the v2 (node/log-buffer) form. */
+CUresult cuGraphInstantiate(CUgraphExec* pExec, CUgraph graph, unsigned long long flags) {
+    ensure_init(); graph_resolve();
+    if (lithos_graph_instantiate(pExec, graph, flags)) return CUDA_SUCCESS;
+    return rg_instantiate(pExec, graph, flags);
+}
+CUresult cuGraphInstantiate_v2(CUgraphExec* pExec, CUgraph graph, CUgraphNode* errNode, char* logBuf, size_t bufSz) {
+    ensure_init(); graph_resolve();
+    if (lithos_graph_instantiate(pExec, graph, 0)) return CUDA_SUCCESS;
+    return rg_instantiate_v2(pExec, graph, errNode, logBuf, bufSz);
+}
+CUresult cuGraphLaunch(CUgraphExec exec, CUstream stream) {
+    ensure_init(); graph_resolve();
+    if (lithos_graph_launch(exec, stream)) return CUDA_SUCCESS;
+    return rg_launch(exec, stream);
+}
+CUresult cuGraphLaunch_ptsz(CUgraphExec exec, CUstream stream) { return cuGraphLaunch(exec, stream); }
+CUresult cuGraphExecDestroy(CUgraphExec exec) {
+    ensure_init(); graph_resolve();
+    if (lithos_graph_exec_destroy(exec)) return CUDA_SUCCESS;
+    return rg_exec_destroy(exec);
+}
+
+/* ------------------------------------------------------------------ */
 /*  cuGetProcAddress interception (transparent to the CUDA runtime)   */
 /* ------------------------------------------------------------------ */
 
@@ -350,6 +402,11 @@ static const struct override overrides[] = {
     { "cuLaunchKernelEx_ptsz",      (void*)cuLaunchKernelEx_ptsz },
     { "cuLaunchCooperativeKernel",  (void*)cuLaunchCooperativeKernel },
     { "cuLaunchCooperativeKernel_ptsz", (void*)cuLaunchCooperativeKernel_ptsz },
+    { "cuGraphInstantiate",         (void*)cuGraphInstantiate },
+    { "cuGraphInstantiateWithFlags",(void*)cuGraphInstantiateWithFlags },
+    { "cuGraphInstantiate_v2",      (void*)cuGraphInstantiate_v2 },
+    { "cuGraphLaunch",              (void*)cuGraphLaunch },
+    { "cuGraphExecDestroy",         (void*)cuGraphExecDestroy },
     { NULL, NULL },
 };
 
