@@ -15,6 +15,10 @@
 /* Lifecycle */
 void lithos_sched_init(void);
 
+/* SMs allocated to this tenant (quota x 2), or 0 if no quota. Used to spoof
+ * CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT for special kernels (§6). */
+int lithos_allocated_sms(void);
+
 /* Stream <-> launch queue (Fig. 9, Step 1). A launch queue is created when an
  * application creates a stream. */
 void lithos_stream_created(CUstream s, int priority);

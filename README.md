@@ -54,7 +54,7 @@ All behaviour is controlled through environment variables — see
 [Configuration](#configuration-environment-variables) for the full list.
 
 > 📄 **Full technical report:** [docs/TECHNICAL_REPORT.md](docs/TECHNICAL_REPORT.md) — every module, how they work together, the reverse-engineering findings, and the framework validation.
-> 📊 **Latency microbenchmark:** [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — interposition ~0.35 µs/launch, atomizer ~4 µs/launch (and why), MPS ≈ free, module-load and gating-scan costs, plus a full **CUDA-graph overhead** profile (atomize-in-graph +120 %+ vs subgraph model single-digit %, and ~8 µs/subgraph reallocation).
+> 📊 **Benchmarks:** [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — (1) launch-latency overhead (interposition ~0.35 µs, atomizer ~4 µs, predictor ~5 µs); (2) **CUDA-graph overhead** (atomize-in-graph +120 %+ vs subgraph single-digit %, ~8 µs/subgraph reallocation); (3) **scheduler-mechanism overhead** (§5.2–5.7); (4) **reproducing the paper's performance experiments** — spatial isolation (HP p99 within 2 % of ideal vs 2.8× under MPS), MPS 3× work conservation, atomization 16× HoL reduction, right-sizing R²≈1.
 > 🔍 **Fidelity vs. the paper:** [docs/FIDELITY.md](docs/FIDELITY.md) — what's faithful, what diverges (the atomizer transfer), what's simplified/stubbed, what's not implemented, and what the paper leaves unspecified.
 
 ## Hardware requirements
@@ -451,6 +451,12 @@ atomizer / scheduler / CUDA graphs / end-to-end — passes for all of them.
 | `LITHOS_ATOM_JUMP` / `LITHOS_BRX` | 0 | *legacy* — drive the dead-end QMD-redirect+SASS-jump path (`legacy/`); unused by the splice atomizer |
 | `LITHOS_QUOTA` | −1 | per-stream TPC quota (compute quotas) |
 | `LITHOS_STEALING` | 1 | enable TPC stealing from idle streams |
+| `LITHOS_PREDICT` | 1 | online latency prediction (§5.7): event-measured, operator-indexed; drives atom sizing/right-sizing/throttle |
+| `LITHOS_RIGHTSIZE` | 0 | per-kernel TPC right-sizing (§5.5): occupancy filter + `l=m/t+b` scaling model |
+| `LITHOS_SLIP` | 1.1 | right-sizing latency-slip factor `k` (e.g. 1.1 = tolerate 10% slowdown) |
+| `LITHOS_THROTTLE` | 0 | enforce the outstanding-work throttle (§5.3): defer dispatch while in-flight µs > limit |
+| `LITHOS_DISPATCH` | 0 | route launches through a single dispatcher thread (§5.2, hand-off) |
+| `LITHOS_LOG_PREDICT` | 0 | log per-operator measured/EMA latencies |
 | `LITHOS_TPC_BASE` | 0 | first TPC of this process's range (give concurrent processes disjoint ranges under MPS) |
 | `LITHOS_GRAPH_SUBGRAPHS` | 0 | **paper-model graph scheduling**: partition each instantiated CUDA graph into K subgraphs (topological cut) and give each subgraph its own TPC allocation, instead of atomizing kernels inside the graph. Kernels run whole; the subgraph is the scheduling unit. Reallocates on replay by re-instantiating only the changed subgraphs |
 | `LITHOS_SUBGRAPH_ROTATE` | 0 | demo: rotate each subgraph's TPC allocation every replay (stands in for a live scheduler changing allocations), which exercises the runtime re-instantiation path |

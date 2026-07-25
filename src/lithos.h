@@ -81,6 +81,11 @@ typedef struct LithosConfig {
     int      atom_tpc_list_n;       /* number of entries in atom_tpc_list (0=off)        */
     int      graph_subgraphs;       /* LITHOS_GRAPH_SUBGRAPHS: partition graphs into K subgraphs (0=off) */
     int      enable_stealing;
+    int      predict;             /* LITHOS_PREDICT: online latency prediction (§5.7) */
+    int      rightsize;           /* LITHOS_RIGHTSIZE: per-kernel TPC right-sizing (§5.5) */
+    double   latency_slip;        /* LITHOS_SLIP: right-sizing latency-slip factor k    */
+    int      throttle;            /* LITHOS_THROTTLE: enforce the outstanding-work limit */
+    int      dispatch;            /* LITHOS_DISPATCH: route launches through a dispatcher thread (§5.2) */
     int      enable_jump;         /* attempt the Prelude->original transfer      */
     int      use_brx;             /* 1 = patch CALL->BRX jump; 0 = keep the CALL  */
     int      verbose;

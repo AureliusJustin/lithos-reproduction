@@ -52,6 +52,7 @@ int atomizer_dispatch_coop(CUfunction f, unsigned gx, unsigned gy, unsigned gz,
  * installed via the libsmctrl-style pre-upload debug callback (qmd.c); this
  * function drives the per-atom launches and metadata updates. */
 int atomizer_dispatch(LithosKernel* k, int quota_tpcs);
+void atomizer_set_ex_pred(double us);   /* predicted us for the next Ex dispatch (§5.7) */
 
 /* Compute the number of atoms from a predicted duration and atom_duration. */
 int atomizer_num_atoms(const LithosKernel* k, double pred_us);

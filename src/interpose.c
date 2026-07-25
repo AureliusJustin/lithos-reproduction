@@ -362,6 +362,23 @@ CUresult cuGraphExecDestroy(CUgraphExec exec) {
     return rg_exec_destroy(exec);
 }
 
+/* Special-kernel support (§6): report the tenant's ALLOCATED SM count for
+ * CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, so cross-block-sync / persistent
+ * kernels that size themselves to the device see only their TPC partition.
+ * Every other attribute is forwarded unchanged. */
+CUresult cuDeviceGetAttribute(int* pi, CUdevice_attribute attrib, CUdevice dev) {
+    ensure_init();
+    CUresult r = g_real.cuDeviceGetAttribute(pi, attrib, dev);
+    if (r == CUDA_SUCCESS && pi && attrib == CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT) {
+        int alloc = lithos_allocated_sms();
+        if (alloc > 0 && alloc < *pi) {
+            if (getenv("LITHOS_VERBOSE")) fprintf(stderr, "[interpose] MULTIPROCESSOR_COUNT %d -> %d (tenant partition)\n", *pi, alloc);
+            *pi = alloc;
+        }
+    }
+    return r;
+}
+
 /* ------------------------------------------------------------------ */
 /*  cuGetProcAddress interception (transparent to the CUDA runtime)   */
 /* ------------------------------------------------------------------ */
@@ -407,6 +424,7 @@ static const struct override overrides[] = {
     { "cuGraphInstantiate_v2",      (void*)cuGraphInstantiate_v2 },
     { "cuGraphLaunch",              (void*)cuGraphLaunch },
     { "cuGraphExecDestroy",         (void*)cuGraphExecDestroy },
+    { "cuDeviceGetAttribute",       (void*)cuDeviceGetAttribute },
     { NULL, NULL },
 };
 

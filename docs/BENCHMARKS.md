@@ -1,8 +1,21 @@
-# LithOS reproduction — latency microbenchmark
+# LithOS reproduction — benchmarks
+
+Benchmarks for the reproduction, all on an **RTX A6000** (GA102, sm_86), CUDA 12.8.
+Sections:
+
+1. **Latency microbenchmark** — host overhead per CUDA call (driver 595.71.05).
+2. **CUDA graph overhead** — the two graph modes + subgraph reallocation (570.195.03).
+3. **Scheduler-mechanism overhead** — per-launch cost of the §5.2–5.7 mechanisms (570.195.03).
+4. **Reproducing the paper's performance experiments** — isolation, work conservation,
+   atomization HoL, right-sizing (570.195.03).
+
+---
+
+## 1. Latency microbenchmark
 
 Measures the **host-side latency overhead** LithOS adds to CUDA calls, and where
-it comes from. All numbers on an **RTX A6000** (GA102, sm_86), **driver 595.71.05**,
-CUDA 12.8, via the driver API under `LD_PRELOAD=build/liblithos_full.so`.
+it comes from. Numbers on **driver 595.71.05**, via the driver API under
+`LD_PRELOAD=build/liblithos_full.so`.
 
 Harness: [`bench/microbench.c`](../bench/microbench.c) + a null kernel
 ([`bench/nullk.cu`](../bench/nullk.cu)). Three probes:
@@ -78,7 +91,7 @@ scan the prefetcher hides, so **not** a linear blow-up even at TensorRT-scale
 
 ---
 
-## CUDA graph overhead
+## 2. CUDA graph overhead
 
 Graphs are the interesting case because the QMD **pre-upload callback fires exactly
 once per graph exec** (at the first `cuGraphLaunch`); replays re-run a compiled
@@ -146,3 +159,119 @@ reallocation rebuilds a 2-node template, not the whole graph.
 - **Dynamic reallocation is ~8 µs per changed subgraph**, paid only on change — the
   subgraph granularity is what makes rescheduling-at-replay affordable.
 - **Correctness holds in every mode and size.**
+
+---
+
+## 3. Scheduler-mechanism overhead (§5.2–5.7)
+
+Per-launch host cost added by the reproduced scheduler mechanisms. Null kernel,
+grid = 1, async-enqueue cost, best-of-N, RTX A6000. Baseline round-trip 5.36 µs.
+
+| configuration | async µs/launch | Δ | source |
+|---|---|---|---|
+| baseline (no LithOS) | 1.81 | — | — |
+| interpose only | 2.16 | +0.35 | wrapper + bookkeeping |
+| atomizer only (predict off) | 5.02 | +2.9 | metadata memsets + event serialize |
+| **predictor only** (§5.7) | 7.39 | **+5.2** | **2 `cuEventRecord`/launch** + operator lookup |
+| atomizer + predictor (**default**) | 12.5 | +10.7 | both |
+| + right-sizing (§5.5) | 12.5 | **≈0** | occupancy query (driver-cached) + model FLOPs |
+| + throttle (§5.3) | ~12.5 | ≈0 under limit* | one `outstanding_us` compare (*blocks by design when over) |
+| + dispatcher (§5.2, opt-in) | 57 | **+45** | cross-thread condvar hand-off per launch |
+| SM-count spoof (§6) | ~12.5 | ≈0 | one-time `cuDeviceGetAttribute`, not per-launch |
+
+* **The predictor (~5 µs, on by default) is the dominant new cost** — entirely the
+  two `cuEventRecord`s that measure real latency. Negligible for real ML kernels
+  (ms-scale) but significant for tiny-kernel floods; a 1-in-N sampling knob would
+  cut it back toward ~6 µs while still learning.
+* **Right-sizing is effectively free** on the launch path (occupancy is
+  driver-cached). **The throttle** adds nothing under the limit and blocks by
+  design over it (deliberately bounding in-flight work). **The dispatcher** is
+  expensive (~45 µs, cross-thread hand-off) — why it's opt-in; it buys the
+  single-dispatch-authority role, not launch throughput. **SM-count spoofing** is
+  one-time.
+
+---
+
+## 4. Reproducing the paper's performance experiments
+
+Reproductions of the paper's main results on a **single RTX A6000** with
+**synthetic kernels** (the paper used an A100 with real models on
+Triton/TensorRT-LLM). Absolute magnitudes differ, but the **mechanisms and
+qualitative results reproduce** in the right ballpark.
+
+### MPS work conservation (the foundation)
+
+Two under-utilizing tenants co-located (aggregate throughput):
+
+| | it/s |
+|---|---|
+| 1 tenant (solo) | 9,846 |
+| 2 tenants, time-slice (no MPS) | 5,815 |
+| 2 tenants, MPS | **17,393** |
+
+→ **MPS ≈ 3.0× time-slicing** — the concurrency LithOS builds on (time-slicing
+even loses to solo, from context-switch overhead).
+
+### Proportional TPC allocation (the QoS primitive, §5.3)
+
+One saturating tenant, throughput vs its `LITHOS_QUOTA`:
+
+`4→389, 8→777, 16→1536, 21→1983, 32→2979, 42→3521 it/s` — **linear in quota**
+(~90 it/s per TPC). Compute quotas give predictable, proportional shares.
+
+### Spatial isolation — MPS vs LithOS TPC-partition (§8.1, Fig. 14/16)
+
+Compute-bound HP (latency-critical) + heavy BE co-located:
+
+| config | HP throughput | HP p50 | **HP p99** |
+|---|---|---|---|
+| HP solo (ideal) | 9,820 it/s | 0.101 ms | 0.109 ms |
+| HP + BE, **plain MPS** (shared TPCs) | 3,465 (35 %) | 0.288 ms | **0.302 ms** (2.8× ideal) |
+| HP + BE, **LithOS partition** (21/21 TPC) | 9,727 (**99 %**) | 0.102 ms | **0.111 ms** (1.02× ideal) |
+
+→ **LithOS fully isolates HP**: p99 within **2 % of ideal** under interference vs
+**2.8×** inflation under naive MPS (a **2.7× tail-latency improvement**), and
+throughput restored 35 %→99 %. Matches §8.1 (MPS has the worst latencies; LithOS
+gives MIG-like spatial isolation at full throughput — the paper reports 13× vs MPS
+on a harder inference workload). *Caveat:* the HP kernel must be compute-bound; a
+launch-bound (tiny) HP is limited by MPS's launch-submission serialization, which
+a central dispatcher (`LITHOS_DISPATCH`) addresses but per-process masking alone
+does not.
+
+### Kernel atomization reduces HoL blocking (§8.4, Fig. 21)
+
+HP (6 µs latency-critical kernel) co-located under MPS with a BE process running a
+**6.75 ms** kernel:
+
+| configuration | HP p50 | HP p99 |
+|---|---|---|
+| HP alone (ideal) | 7.7 µs | 17 µs |
+| + BE, **not atomized** (HoL) | 6,319 µs | **6,385 µs** |
+| + BE, **atomized** (~13 × 0.5 ms atoms) | 324 µs | **~400 µs** |
+
+→ Atomizing the long BE kernel cuts HP tail latency **16×** (6,385→400 µs); the
+residual ≈ **one atom** (0.65 ms) — exactly the paper's mechanism (HoL blocking
+bounded by atom size, not kernel size). Finer atoms reduce it further; the paper's
+ms-scale HP + 250–500 µs atoms land within 14 % of ideal.
+
+### Right-sizing scaling curves (§8.2, Fig. 12/18)
+
+`l = m/t + b` fit across TPC counts:
+
+| kernel | fit | R² | right-size @ slip 1.1 | capacity saved | latency |
+|---|---|---|---|---|---|
+| matmul (scales well) | `26.80/t + 0.010` | **1.0000** | 39 TPC | 7 % | 1.08× |
+| heavy (diminishing returns) | `0.34/t + 0.015` | **0.9991** | 33 TPC | 21 % | 1.09× |
+
+→ Model accuracy **R² 0.999–1.0** (paper 0.92–0.99); latency cost **~1.08×** at
+slip 1.1 (paper ~4 % mean P99); savings scale with how poorly a kernel scales
+(paper mean 26 % over a real-kernel mix).
+
+### What we could not reproduce
+
+- The full **multi-system comparison** (MIG / REEF / TGS / Orion / Priority) —
+  needs those other systems.
+- **DVFS energy savings** (§8.3) — needs power measurement; DVFS is out of scope
+  here.
+- **Real inference-serving SLO attainment** (Triton + real models) — needs the
+  serving stack; the synthetic HP/BE proxies stand in for the mechanism behaviour.

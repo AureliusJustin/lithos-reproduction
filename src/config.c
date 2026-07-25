@@ -41,6 +41,11 @@ static void cfg_init_once(void) {
     }
     g_lithos_cfg.graph_subgraphs = envi("LITHOS_GRAPH_SUBGRAPHS", 0);
     g_lithos_cfg.enable_stealing       = envi("LITHOS_STEALING", 1);
+    g_lithos_cfg.predict               = envi("LITHOS_PREDICT", 1);
+    g_lithos_cfg.rightsize             = envi("LITHOS_RIGHTSIZE", 0);
+    g_lithos_cfg.latency_slip          = envd("LITHOS_SLIP", 1.1);
+    g_lithos_cfg.throttle              = envi("LITHOS_THROTTLE", 0);
+    g_lithos_cfg.dispatch              = envi("LITHOS_DISPATCH", 0);
     /* The transparent Prelude redirect is proven, but the Prelude->original
      * tail-transfer needs a compiler-emitted JUMP (see docs); gated off so the
      * library stays correct by default. */

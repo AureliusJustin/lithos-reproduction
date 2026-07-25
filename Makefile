@@ -22,7 +22,7 @@ all: $(BUILD)/liblithos_full.so $(BUILD)/libcuda.so.1 tests
 # ----------------------------------------------------------------------
 FULL_SRC := src/interpose.c src/real.c src/config.c src/sched.c \
             src/atomizer.c src/atomize_splice.c src/fatbin.c src/qmd.c \
-            src/graphsched.c
+            src/graphsched.c src/predict.c
 
 # liblithos_full.so: LD_PRELOAD in front of a driver-API app.
 $(BUILD)/liblithos_full.so: $(FULL_SRC) src/*.h | $(BUILD)

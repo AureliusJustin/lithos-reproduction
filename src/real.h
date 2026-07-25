@@ -47,6 +47,7 @@ typedef struct RealDriver {
                                           CUstream, void**);
     CUresult (*cuGetExportTable)(const void**, const CUuuid*);
     CUresult (*cuStreamIsCapturing)(CUstream, CUstreamCaptureStatus*);
+    CUresult (*cuDeviceGetAttribute)(int*, CUdevice_attribute, CUdevice);
 } RealDriver;
 
 extern RealDriver g_real;

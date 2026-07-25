@@ -66,6 +66,9 @@ static size_t         g_prolen;
 static int            g_prologue_ready;
 static int            g_dev_sm;           /* running device SM (e.g. 86)         */
 static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
+/* predicted duration for the NEXT Ex dispatch on this thread (set by sched.c) */
+static __thread double g_ex_pred_us = 0;
+void atomizer_set_ex_pred(double us) { g_ex_pred_us = us; }
 
 /* ------------------------------------------------------------------ */
 /*  Which loaded objects were successfully atomized                   */
@@ -283,9 +286,12 @@ static int is_full_func(CUfunction f) {
     return handle_in(g_full_funcs, g_full_funcs_n, (void*)f);
 }
 
-/* Number of atoms for a given block count = ceil(pred_us / atom_duration),
- * clamped to [1, blocks]. pred_us is stubbed proportional to the block count. */
-static int decide_atoms(uint64_t blocks) {
+/* Number of atoms = ceil(predicted_duration / atom_duration), clamped to
+ * [1, blocks] (§5.4). `pred_us` is the online predictor's estimate (§5.7) when
+ * available; otherwise we fall back to the `blocks x 0.5us` stub. For very large
+ * grids the atom_duration is scaled up to bound early-exit thread-block traffic
+ * (the paper's aggressiveness control). */
+static int decide_atoms(uint64_t blocks, double pred_us) {
     if (!g_lithos_cfg.enable_atomizer) return 1;
     if (g_lithos_cfg.graph_subgraphs > 1) return 1;  /* graphs: subgraph is the unit, kernels run whole */
     if (g_lithos_cfg.force_atoms > 0) {   /* explicit override (testing/policy) */
@@ -295,13 +301,14 @@ static int decide_atoms(uint64_t blocks) {
     if (blocks < (uint64_t)g_lithos_cfg.min_blocks_to_atomize) return 1;
     double atom_us = g_lithos_cfg.atom_duration_us;
     if (blocks > 4096) atom_us *= 2.0;
-    int n = (int)((double)blocks * 0.5 / atom_us);
+    double dur = (pred_us > 0) ? pred_us : (double)blocks * 0.5;   /* predictor, or stub */
+    int n = (int)(dur / atom_us);
     if (n < 1) n = 1;
     if ((uint64_t)n > blocks) n = (int)blocks;
     return n;
 }
 int atomizer_num_atoms(const LithosKernel* k, double pred_us) {
-    (void)pred_us; return decide_atoms(k->total_blocks);
+    return decide_atoms(k->total_blocks, pred_us);
 }
 
 /* Write {lo,hi} to the shared metadata address, ordered on the launch stream
@@ -370,7 +377,7 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
         return 1;
     }
 
-    int n = decide_atoms(blocks);
+    int n = decide_atoms(blocks, k->pred_us);
     uint64_t per = (blocks + n - 1) / n;
     int launched = 0;
     pthread_mutex_lock(&g_mtx);
@@ -408,7 +415,7 @@ int atomizer_dispatch_ex(const CUlaunchConfig* cfg, CUfunction f, void** params,
     for (unsigned i = 0; i < cfg->numAttrs; i++)
         if (cfg->attrs[i].id == CU_LAUNCH_ATTRIBUTE_COOPERATIVE ||
             cfg->attrs[i].id == CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION) { nosplit = 1; break; }
-    int n = nosplit ? 1 : decide_atoms(blocks);
+    int n = nosplit ? 1 : decide_atoms(blocks, g_ex_pred_us);
     uint64_t per = (blocks + n - 1) / n;
     int launched = 0;
     pthread_mutex_lock(&g_mtx);

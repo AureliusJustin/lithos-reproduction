@@ -83,6 +83,7 @@ static void real_init_once(void) {
     g_real.cuLaunchCooperativeKernel = (typeof(g_real.cuLaunchCooperativeKernel))lithos_real_sym("cuLaunchCooperativeKernel");
     g_real.cuGetExportTable          = (typeof(g_real.cuGetExportTable))lithos_real_sym("cuGetExportTable");
     g_real.cuStreamIsCapturing       = (typeof(g_real.cuStreamIsCapturing))lithos_real_sym("cuStreamIsCapturing");
+    g_real.cuDeviceGetAttribute      = (typeof(g_real.cuDeviceGetAttribute))lithos_real_sym("cuDeviceGetAttribute");
 }
 
 void lithos_real_init(void) {

@@ -21,19 +21,19 @@ Legend: ✅ faithful · ≈ divergent (same goal, different mechanism) · ◑ si
 | TPC masking (QMD) | reverse-engineered; Ampere, **Hopper**, Ada; extends libsmctrl | reverse-engineered; **Ampere only** tested (Hopper offsets present, untested) | ◑ |
 | Compute quotas | guaranteed TPCs per tenant | `LITHOS_QUOTA` → QMD mask, verified | ✅ |
 | TPC stealing | idle tenants lend TPCs | implemented (timestamp idle-detection) | ◑ |
-| Launch queues / dispatcher | per-stream queues + dispatcher/tracker threads (Fig. 9) | per-stream bookkeeping, **synchronous** dispatch (no threads) | ◑ |
-| Outstanding-work throttle | 100 µs sync-queue throttle, event reaping | counters only, **not enforced** | ◑ |
-| Duration predictor | a predictor (§5.7) | **stub**: `blocks × 0.5 µs` | ◑ |
-| Hardware right-sizing | yes | ✗ | ✗ |
-| Power management | yes | ✗ | ✗ |
+| Launch queues / dispatcher | per-stream queues + dispatcher/tracker threads (Fig. 9) | per-stream launch queues; a **Tracker thread** reaps completions; a **Dispatcher thread** submits launches (`LITHOS_DISPATCH`, opt-in — a hand-off, since a transparent interposer can't safely snapshot `cuLaunchKernel`'s implicit-size args) | ◑→✅ |
+| Outstanding-work throttle | 100 µs sync-queue throttle, event reaping | **enforced** (`LITHOS_THROTTLE`): defers dispatch until event-reaped in-flight µs < limit | ✅ |
+| Duration predictor | a predictor (§5.7) | **online event-measured, operator-indexed** (ordinal k per launch queue, reset on sync), EMA-refined, TPC-scaled | ✅ |
+| Hardware right-sizing | yes | **occupancy filtering heuristic + `l=m/t+b` scaling model + latency-slip `k`** (`LITHOS_RIGHTSIZE`, `LITHOS_SLIP`) | ✅ |
+| Power management | yes | ✗ (out of scope) | ✗ |
 | **Atomizer control transfer** | QMD **program-address → Prelude**, Prelude **jumps** into the original (Rust/LLVM tail call) | **splice the range-check into each kernel's own `.text`** so in-range blocks **fall through**; no Prelude, no jump, no QMD redirect | ≈ |
 | When atomization is applied | at launch (patch the live QMD) | at **module load** (ELF surgery on the cubin) | ≈ |
 | Per-atom metadata delivery | Prelude gets an `AtomMetadata` struct; **mechanism not specified** | shared device buffer written per launch (`cuMemsetD32Async`) + event serialization | ? |
-| Atom sizing | target duration 250–500 µs | same knob (`LITHOS_ATOM_US`), fed by the stub predictor | ◑ |
+| Atom sizing | target duration 250–500 µs | `LITHOS_ATOM_US`, fed by the **online predictor** (falls back to the stub only until an operator is learned) | ✅ |
 | CUDA Graphs | "interpose graph creation APIs and atomize graphs into subgraphs, ensuring correct execution ordering" | **both** interpretations: (a) atomize kernels into an in-graph subgraph (default, correct but schedule frozen); (b) `LITHOS_GRAPH_SUBGRAPHS=K` partitions the graph into K subgraphs along a topological cut, each independently TPC-allocated (the paper's likely intent) | ✅≈ |
 | Graph replay rescheduling | (unspecified) | TPC mask **cannot** change on replay — QMD pre-upload callback fires once/exec; reallocation needs re-instantiation (subgraph granularity makes it cheap) | ? |
 | Hopper Thread Block Clusters | atoms are multiples of cluster size | cluster launches detected and **not split** (no cluster-multiple sizing) | ◑ |
-| Special (cross-block-sync/persistent) kernels | disable stealing+atomization; report allocated SM count via `cuDeviceGetAttribute` | cooperative/cluster launches not split; **`cuDeviceGetAttribute` not adjusted**; non-cooperative cross-block-sync undetectable | ◑ |
+| Special (cross-block-sync/persistent) kernels | disable stealing+atomization; report allocated SM count via `cuDeviceGetAttribute` | cooperative/cluster launches **not split** and given their **exact quota (no stealing/right-sizing)**; **`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)` spoofed** to `quota×2` SMs; non-cooperative persistent kernels still undetectable | ✅≈ |
 | Multi-tenant coordination | central scheduler assigns resources across tenants | **per-process**; `LITHOS_TPC_BASE` gives manual disjoint ranges (no central coordinator) | ◑ |
 | MPS | "we build on top of MPS" | auto-starts MPS; concurrency + partitioning verified | ✅ |
 
@@ -110,16 +110,48 @@ program-address redirect. It is functionally the same per-block gate (Algorithm
 
 ---
 
+## Now implemented (§5.2–5.7 scheduler mechanisms)
+
+The scheduler beyond quotas/stealing — previously stubbed — is now reproduced
+([`src/predict.c`](../src/predict.c), [`src/sched.c`](../src/sched.c)):
+
+- **Online latency predictor (§5.7).** Real, event-measured per-kernel latency,
+  keyed by **operator ordinal `k`** on each launch queue (reset at sync/batch
+  boundaries — the paper's DFG-node identification), EMA-refined, TPC-scaled. On by
+  default (`LITHOS_PREDICT`); drives atom sizing, right-sizing, and the throttle.
+- **Hardware right-sizing (§5.5)** (`LITHOS_RIGHTSIZE`). The **occupancy filtering
+  heuristic** (blocks / occupancy-per-TPC via `cuOccupancyMaxActiveBlocksPerMultiprocessor`)
+  plus the **`l = m/t + b` scaling model** fit from the all-TPC and 1-TPC samples
+  (probed online), reducing a kernel to the fewest TPCs within a **latency-slip
+  factor `k`** (`LITHOS_SLIP`). Verified: an 8-block kernel → 1 TPC; a large kernel
+  → 4 TPCs at 1.5× slip.
+- **Tracker thread + outstanding-work throttle (§5.3)** (`LITHOS_THROTTLE`). A
+  Tracker thread reaps completion events, feeds the predictor, and maintains the
+  in-flight-µs counter; dispatch is deferred while it exceeds the limit (paper:
+  100 µs).
+- **Dispatcher thread / launch queues (§5.2)** (`LITHOS_DISPATCH`, opt-in). Launches
+  funnel through one dispatcher thread that applies global policy and submits to the
+  GPU. It's a *hand-off* (the app thread waits until the dispatcher consumes the
+  request) rather than a fire-and-forget enqueue, because a transparent interposer
+  can't safely snapshot `cuLaunchKernel`'s `void**` args — their sizes are implicit
+  — so we keep them alive across the hand-off instead of copying them. This gives
+  the single-dispatch-authority role without the CPU-latency decoupling.
+- **Special kernels (§6).** Cooperative/cluster launches are not atomized and get
+  their **exact quota** (stealing + right-sizing disabled), and
+  `cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)` is **spoofed** to the tenant's
+  allocated SM count (`quota × 2`).
+
+---
+
 ## Simplified or stubbed (present but not to the paper's depth)
 
-- **Scheduler threading model.** The paper describes launch queues fed by a
-  dispatcher and a tracker thread reaping completions (Fig. 9). Ours keeps the
-  per-stream *state* (quota, TPC range, outstanding counter) but dispatches
-  **synchronously** in the calling thread; there is no async dispatcher/tracker.
-- **Outstanding-work throttle.** We *count* in-flight launches but do **not**
-  enforce the 100 µs sync-queue throttle (no blocking/reaping loop).
-- **Duration predictor.** Replaced by `blocks × 0.5 µs`; the real §5.7 predictor
-  is absent. Atom count therefore isn't driven by a real time estimate.
+- **Predictor sophistication.** Ours is operator-ordinal + EMA + a 2-point scaling
+  curve; it does not model input-size features beyond the ordinal, and probing
+  advances on async reaps (a few iterations of warm-up). The stub `blocks × 0.5 µs`
+  remains only as the cold-start fallback before an operator is first measured.
+- **Dispatcher decoupling.** The dispatcher is a correct hand-off, not a
+  fire-and-forget async enqueue (see above) — the app thread still blocks until
+  submission, so there's no CPU-launch-latency win, only the central-scheduling role.
 - **API coverage.** We override only the calls the mechanisms need and forward
   the rest; we do not macro-generate the entire Driver API.
 - **Hopper.** `qmd.c` carries the Hopper (TMD ≥ 0x40) mask offsets but they are
@@ -129,16 +161,14 @@ program-address redirect. It is functionally the same per-block gate (Algorithm
 
 ## Not implemented
 
-- **Hardware right-sizing** (dynamically shrinking a tenant's TPC allocation to
-  its actual need).
 - **Power management.**
 - **Central multi-tenant scheduler.** Our scheduler is per-process; disjoint TPC
   ranges across tenants are assigned manually via `LITHOS_TPC_BASE` rather than by
   a coordinator. Cross-process quota arbitration, fairness, and preemption
   policies are out of scope.
-- **`cuDeviceGetAttribute` spoofing** of `MULTIPROCESSOR_COUNT` for
-  cross-block-sync kernels (the paper returns the allocated SM count so such
-  kernels size themselves to their partition).
+- **Non-cooperative persistent-kernel detection.** We detect cross-block-sync via
+  the cooperative/cluster launch attributes; a persistent kernel that grid-syncs
+  without those attributes is still undetectable transparently.
 - **Explicit CUDA-graph construction API** interposition — the *atomize-in-graph*
   mode only sees stream capture (it intercepts `cuLaunchKernel`), so manually-built
   graphs (`cuGraphAddKernelNode`) aren't atomized. (The *subgraph* mode does handle
