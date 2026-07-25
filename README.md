@@ -86,11 +86,14 @@ arches fault).
         │  cuStreamCreate / cuLaunchKernel / cuStreamSynchronize / cuGetProcAddress
         ▼
   ┌─────────────────────────────  LibLithOS  ─────────────────────────────┐
-  │ interpose.c   CUDA Driver API interposition (Section 5.2 / 6)          │
-  │ sched.c       TPC Scheduler: launch queues, quotas→TPC masks,          │
-  │               TPC stealing, outstanding-work tracking (Section 5.3)    │
-  │ atomizer.c    Kernel Atomizer: range-check prologue spliced into each  │
-  │ qmd.c         kernel's SASS, per-atom metadata (Section 5.4 / 6)       │
+  │ interpose.c     CUDA Driver API interposition (Section 5.2 / 6)        │
+  │ sched*.c        TPC Scheduler: launch queues, quotas→TPC masks, TPC    │
+  │ tpc_alloc.c     stealing, right-sizing, outstanding-work (Section 5.3) │
+  │ dispatch.c      optional dispatcher thread (Section 5.2)               │
+  │ predict.c       online latency prediction + Tracker (Section 5.7)      │
+  │ atomizer.c      Kernel Atomizer: range-check prologue spliced into     │
+  │ qmd.c           each kernel's SASS, per-atom metadata (Section 5.4/6)  │
+  │ graphsched.c    CUDA-graph subgraph scheduling (Section 6)             │
   └───────────────────────────────┬───────────────────────────────────────┘
                                    ▼   forwards everything else
                           real libcuda.so.1 (NVIDIA driver)
@@ -101,7 +104,12 @@ arches fault).
 | `src/interpose.c` | overrides `cuInit`, `cuStreamCreate[WithPriority]`, `cuStreamDestroy`, `cuLaunchKernel[_ptsz]`, `cuStreamSynchronize`, `cuCtxSynchronize`, and `cuGetProcAddress_v2`; forwards the rest |
 | `src/real.c` | resolves the genuine driver entry points (`dlsym(RTLD_NEXT)` / driver `cuGetProcAddress`) |
 | `src/wrapper.c` | `libcuda.so.1` glue: `dlopen` redirect + `CUDA_DEVICE_MAX_CONNECTIONS` |
-| `src/sched.c` | TPC scheduler: launch-queue bookkeeping, compute quotas → TPC masks, TPC stealing, sync-queue tracking |
+| `src/sched.c` | the submit path: ties launch queues → TPC mask → prediction → right-sizing → throttle → atomizer together; sync/batch handling |
+| `src/sched_stream.c` | the stream registry = per-stream **launch queues** (Fig. 9 ①): quotas, TPC ranges, idle/outstanding bookkeeping, TPC detection |
+| `src/tpc_alloc.c` | turning a quota into an SM-disable mask: **compute quotas** (②), **TPC stealing**, per-atom/per-subgraph slice masks, **right-sizing** (⑥) |
+| `src/dispatch.c` | the optional **dispatcher thread** (§5.2) that owns submission (`LITHOS_DISPATCH`) |
+| `src/predict.c` | **online latency prediction** (§5.7) + the **Tracker thread** that reaps completion events |
+| `src/graphsched.c` | CUDA-graph **subgraph partitioning** + per-subgraph TPC allocation with runtime re-instantiation |
 | `src/qmd.c` | QMD/TMD pre-upload hook (libsmctrl-style debug callback): TPC mask (scheduler), program-address capture/patch, register-count bump |
 | `src/atomizer.c` | Kernel Atomizer: module-load hook, atom splitting, stream-ordered metadata (prologue-splice model) |
 | `src/atomize_splice.c` | builds the NVRTC range-check prologue and splices it into each **kernel-entry** `.text` section (ELF surgery: headers, `.nv.info`, symbols, and `-rdc` relocations); skips `__device__` functions |
@@ -247,7 +255,7 @@ Because each atom is a *separate* relaunch and the QMD TPC mask is **one-shot**
 **distinct mask before each atom** — so the atoms of one kernel can each run on a
 different TPC set. This realizes the paper's statement that *"TPC allocations can
 be dynamically adjusted throughout a kernel's execution"* (§5.4). It's driven by
-`lithos_apply_atom_mask()` ([`src/sched.c`](src/sched.c)), called from the atom
+`lithos_apply_atom_mask()` ([`src/tpc_alloc.c`](src/tpc_alloc.c)), called from the atom
 loop ([`src/atomizer.c`](src/atomizer.c)):
 
 - **`LITHOS_ATOM_TPC=W`** — atom *i* is confined to a distinct contiguous **W-TPC
@@ -450,7 +458,8 @@ atomizer / scheduler / CUDA graphs / end-to-end — passes for all of them.
 | `LITHOS_ATOM_TPC_LIST` | — | **variable** per-atom widths, e.g. `1,2,3` → atom *i* gets `list[i % n]` TPCs, packed contiguously and cycled (overrides `LITHOS_ATOM_TPC`) |
 | `LITHOS_ATOM_JUMP` / `LITHOS_BRX` | 0 | *legacy* — drive the dead-end QMD-redirect+SASS-jump path (`legacy/`); unused by the splice atomizer |
 | `LITHOS_QUOTA` | −1 | per-stream TPC quota (compute quotas) |
-| `LITHOS_STEALING` | 1 | enable TPC stealing from idle streams |
+| `LITHOS_STEALING` | 1 | enable TPC stealing from idle streams (needs disjoint ranges — see `LITHOS_PERSTREAM_QUOTA`) |
+| `LITHOS_PERSTREAM_QUOTA` | 0 | give **each stream** its own disjoint quota-sized TPC slice instead of one shared application-wide range. Required for intra-process TPC stealing to have anything to lend |
 | `LITHOS_PREDICT` | 1 | online latency prediction (§5.7): event-measured, operator-indexed; drives atom sizing/right-sizing/throttle |
 | `LITHOS_RIGHTSIZE` | 0 | per-kernel TPC right-sizing (§5.5): occupancy filter + `l=m/t+b` scaling model |
 | `LITHOS_SLIP` | 1.1 | right-sizing latency-slip factor `k` (e.g. 1.1 = tolerate 10% slowdown) |

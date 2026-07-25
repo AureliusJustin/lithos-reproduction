@@ -27,6 +27,7 @@
 #include "lithos_sched.h"
 #include "lithos.h"
 #include "atomizer.h"
+#include "predict.h"
 
 #define LOG(...) do { if (g_lithos_cfg.verbose) { \
     fprintf(stderr, "[lithos] " __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -362,6 +363,35 @@ CUresult cuGraphExecDestroy(CUgraphExec exec) {
     return rg_exec_destroy(exec);
 }
 
+/* ---- CUDA graph capture window -------------------------------------------
+ * The predictor's Tracker thread must issue no CUDA calls while a capture is
+ * open, or it can invalidate it. Watching launches is not enough: the window
+ * opens at cuStreamBeginCapture, which may be followed by app work we never see.
+ * Intercepting the capture calls themselves closes the window exactly. */
+#undef cuStreamBeginCapture
+#undef cuStreamEndCapture
+static CUresult (*rg_begin_capture)(CUstream, CUstreamCaptureMode);
+static CUresult (*rg_end_capture)(CUstream, CUgraph*);
+
+CUresult cuStreamBeginCapture_v2(CUstream s, CUstreamCaptureMode mode) {
+    ensure_init();
+    if (!rg_begin_capture)
+        rg_begin_capture = (typeof(rg_begin_capture))lithos_real_sym("cuStreamBeginCapture_v2");
+    predict_capture_begin();                 /* park the Tracker for the duration */
+    return rg_begin_capture(s, mode);
+}
+CUresult cuStreamBeginCapture(CUstream s, CUstreamCaptureMode mode) {
+    return cuStreamBeginCapture_v2(s, mode);
+}
+CUresult cuStreamEndCapture(CUstream s, CUgraph* g) {
+    ensure_init();
+    if (!rg_end_capture)
+        rg_end_capture = (typeof(rg_end_capture))lithos_real_sym("cuStreamEndCapture");
+    CUresult r = rg_end_capture(s, g);
+    predict_capture_end();                   /* Tracker may resume */
+    return r;
+}
+
 /* Special-kernel support (§6): report the tenant's ALLOCATED SM count for
  * CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, so cross-block-sync / persistent
  * kernels that size themselves to the device see only their TPC partition.
@@ -425,6 +455,9 @@ static const struct override overrides[] = {
     { "cuGraphLaunch",              (void*)cuGraphLaunch },
     { "cuGraphExecDestroy",         (void*)cuGraphExecDestroy },
     { "cuDeviceGetAttribute",       (void*)cuDeviceGetAttribute },
+    { "cuStreamBeginCapture",       (void*)cuStreamBeginCapture },
+    { "cuStreamBeginCapture_v2",    (void*)cuStreamBeginCapture_v2 },
+    { "cuStreamEndCapture",         (void*)cuStreamEndCapture },
     { NULL, NULL },
 };
 

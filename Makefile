@@ -20,7 +20,8 @@ all: $(BUILD)/liblithos_full.so $(BUILD)/libcuda.so.1 tests
 #  The Prelude is JIT-compiled at runtime via NVRTC (address baked in), so no
 #  prelude.o is linked; prelude.cu is retained as documentation.
 # ----------------------------------------------------------------------
-FULL_SRC := src/interpose.c src/real.c src/config.c src/sched.c \
+FULL_SRC := src/interpose.c src/real.c src/config.c \
+            src/sched.c src/sched_stream.c src/tpc_alloc.c src/dispatch.c \
             src/atomizer.c src/atomize_splice.c src/fatbin.c src/qmd.c \
             src/graphsched.c src/predict.c
 
@@ -43,7 +44,7 @@ tests: $(BUILD)/test_interpose $(BUILD)/test_interpose_driver \
        $(BUILD)/test_atomize_runtime $(BUILD)/test_atomize_graph \
        $(BUILD)/atomize_mark.cubin $(BUILD)/atomize_mark.fatbin \
        $(BUILD)/atomize_mark.ptx $(BUILD)/test_scheduler \
-       $(BUILD)/correctness_matrix
+       $(BUILD)/correctness_matrix $(BUILD)/test_stealing $(BUILD)/steal_probe.cubin
 
 # CUDA-runtime apps (exercise the libcuda.so.1 wrapper path used by frameworks)
 $(BUILD)/test_interpose: tests/test_interpose.cu | $(BUILD)
@@ -73,6 +74,10 @@ $(BUILD)/atomize_mark.ptx: tests/atomize_mark.cu | $(BUILD)
 	$(NVCC) -arch=$(ARCH) -ptx $< -o $@
 $(BUILD)/test_atomize_cubin: tests/test_atomize_cubin.c | $(BUILD)
 	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
+$(BUILD)/test_stealing: tests/test_stealing.c | $(BUILD)
+	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
+$(BUILD)/steal_probe.cubin: tests/steal_probe.cu | $(BUILD)
+	$(NVCC) -arch=$(ARCH) -cubin $< -o $@
 $(BUILD)/test_scheduler: tests/test_scheduler.c | $(BUILD)
 	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
 
@@ -94,6 +99,9 @@ run_tests: all
 	LITHOS_ATOM_US=8 LD_LIBRARY_PATH=$(BUILD) $(BUILD)/test_atomize_graph 512
 	@echo "== TPC scheduler compute quota (4 TPCs) =="
 	LITHOS_QUOTA=4 LITHOS_STEALING=0 LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_scheduler
+	@echo "== TPC Stealing: idle stream's TPCs lent to a busy one (5.3) =="
+	STEAL_CUBIN=$(BUILD)/steal_probe.cubin LITHOS_QUOTA=4 LITHOS_PERSTREAM_QUOTA=1 LITHOS_STEALING=0 LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_stealing
+	STEAL_CUBIN=$(BUILD)/steal_probe.cubin LITHOS_QUOTA=4 LITHOS_PERSTREAM_QUOTA=1 LITHOS_STEALING=1 LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_stealing
 	@echo "== Correctness matrix -- varied kernels vs CPU reference, forced max-split =="
 	LITHOS_ATOM_US=1 LITHOS_STATS=1 LD_LIBRARY_PATH=$(BUILD) $(BUILD)/correctness_matrix
 

@@ -30,10 +30,12 @@ double predict_lookup(int slot, int op, int tpcs, uint64_t blocks);
  * collect a missing model point (all-TPC or 1-TPC), or 0 if no probe needed. */
 int    predict_rightsize(int slot, int op, int all_tpcs, double slip, int* want_probe);
 
-/* Event-measured feedback. sched.c records a start/stop event pair around the
- * launch and submits it; the tracker thread reaps it and updates the table. */
+/* Event-measured feedback. sched.c records ONE event on the launch stream AFTER
+ * the launch (a completion marker) and submits it; the Tracker reaps it, derives
+ * the duration as the gap from the previous completion on the same queue, and
+ * updates the table. One event per launch, not a start/stop pair — see predict.c. */
 CUevent predict_evt_get(void);
-void    predict_submit(int slot, int op, int tpcs, CUevent start, CUevent stop);
+void    predict_submit(int slot, int op, int tpcs, CUevent done_evt);
 
 /* Outstanding work (§5.3): us of in-flight (submitted-not-yet-reaped) work. */
 double  predict_outstanding_us(void);
@@ -41,5 +43,11 @@ double  predict_outstanding_us(void);
 /* Start the Tracker thread (reaps completions, feeds the table, decrements
  * outstanding). Idempotent. */
 void    predict_start_tracker(void);
+
+/* Park/unpark the Tracker around CUDA stream capture. While a capture is open,
+ * CUDA calls from other threads on the same context can invalidate it, so the
+ * Tracker must not touch events; pending measurements are reaped afterwards. */
+void    predict_capture_begin(void);
+void    predict_capture_end(void);
 
 #endif

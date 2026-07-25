@@ -3,15 +3,24 @@
 Benchmarks for the reproduction, all on an **RTX A6000** (GA102, sm_86), CUDA 12.8.
 Sections:
 
-1. **Latency microbenchmark** — host overhead per CUDA call (driver 595.71.05).
+1. **Latency microbenchmark** — the original host-overhead measurement (driver
+   595.71.05); *historical, superseded by §3*.
 2. **CUDA graph overhead** — the two graph modes + subgraph reallocation (570.195.03).
-3. **Scheduler-mechanism overhead** — per-launch cost of the §5.2–5.7 mechanisms (570.195.03).
+3. **Per-component overhead** — current full-system breakdown: every component's
+   per-launch cost, module-load/splice scaling, graph replay (570.195.03).
 4. **Reproducing the paper's performance experiments** — isolation, work conservation,
    atomization HoL, right-sizing (570.195.03).
 
 ---
 
 ## 1. Latency microbenchmark
+
+> **Historical.** This section is the original measurement (driver 595.71.05),
+> taken before the scheduler mechanisms were added and before the atomizer's
+> per-launch path was optimized. **§3 supersedes it** for current per-component
+> costs — notably the atomizer is now ~1 µs, not ~4 µs. Kept because it documents
+> the module-load and gating-scan scaling, and the *reasoning* about where the
+> atomizer's cost comes from.
 
 Measures the **host-side latency overhead** LithOS adds to CUDA calls, and where
 it comes from. Numbers on **driver 595.71.05**, via the driver API under
@@ -162,33 +171,101 @@ reallocation rebuilds a 2-node template, not the whole graph.
 
 ---
 
-## 3. Scheduler-mechanism overhead (§5.2–5.7)
+## 3. Per-component overhead (full system breakdown)
 
-Per-launch host cost added by the reproduced scheduler mechanisms. Null kernel,
-grid = 1, async-enqueue cost, best-of-N, RTX A6000. Baseline round-trip 5.36 µs.
+Every LithOS component's host cost, measured on a null kernel (grid = 1) so the
+numbers isolate host overhead rather than GPU work. Async-enqueue cost,
+best-of-3, RTX A6000 / driver 570.195.03.
 
-| configuration | async µs/launch | Δ | source |
+### Per-launch cost by component
+
+| configuration | µs/launch | Δ vs baseline | what it adds |
 |---|---|---|---|
-| baseline (no LithOS) | 1.81 | — | — |
-| interpose only | 2.16 | +0.35 | wrapper + bookkeeping |
-| atomizer only (predict off) | 5.02 | +2.9 | metadata memsets + event serialize |
-| **predictor only** (§5.7) | 7.39 | **+5.2** | **2 `cuEventRecord`/launch** + operator lookup |
-| atomizer + predictor (**default**) | 12.5 | +10.7 | both |
-| + right-sizing (§5.5) | 12.5 | **≈0** | occupancy query (driver-cached) + model FLOPs |
-| + throttle (§5.3) | ~12.5 | ≈0 under limit* | one `outstanding_us` compare (*blocks by design when over) |
-| + dispatcher (§5.2, opt-in) | 57 | **+45** | cross-thread condvar hand-off per launch |
-| SM-count spoof (§6) | ~12.5 | ≈0 | one-time `cuDeviceGetAttribute`, not per-launch |
+| **[A]** baseline (no LithOS) | **1.88** | — | — |
+| **[B]** interposition only | 2.49 | +0.6 | wrapper call-chain + launch-queue bookkeeping + QMD callback |
+| **[D]** atomizer only (predict off) | 2.84 | **+1.0** | metadata write + gating lookup |
+| **[C]** predictor only (atomizer off) | 6.07 | **+3.6** | 1 `cuEventRecord`/launch + operator lookup + Tracker reap |
+| **[E]** atomizer + predictor (**default**) | 5.93 | +4.1 | both |
+| **[F]** + right-sizing | 6.57 | +0.6 vs [E] | occupancy query (driver-cached) + model eval |
+| **[G]** + TPC quota | 7.05 | +1.1 vs [E] | mask computation + QMD write on the upload path |
+| **[H]** + throttle (null-kernel flood) | 25.7 | — | *not overhead*: the throttle is deliberately deferring, since a null-kernel flood keeps the host far ahead of the GPU |
+| **[I]** + dispatcher (opt-in) | 37.0 | +31 | cross-thread condvar hand-off per launch |
 
-* **The predictor (~5 µs, on by default) is the dominant new cost** — entirely the
-  two `cuEventRecord`s that measure real latency. Negligible for real ML kernels
-  (ms-scale) but significant for tiny-kernel floods; a 1-in-N sampling knob would
-  cut it back toward ~6 µs while still learning.
-* **Right-sizing is effectively free** on the launch path (occupancy is
-  driver-cached). **The throttle** adds nothing under the limit and blocks by
-  design over it (deliberately bounding in-flight work). **The dispatcher** is
-  expensive (~45 µs, cross-thread hand-off) — why it's opt-in; it buys the
-  single-dispatch-authority role, not launch throughput. **SM-count spoofing** is
-  one-time.
+**The atomizer is now the cheap part (+1.0 µs) and the predictor the expensive one
+(+3.6 µs).** That is the reverse of the earlier balance, after removing three
+redundancies from the atomizer's per-launch path:
+
+* a **duplicated `cuStreamIsCapturing`** — sched.c and the atomizer each asked;
+  sched.c now determines it once and passes the answer down;
+* the **cross-stream serialization** (`cuStreamWaitEvent` + `cuEventRecord`) is
+  skipped while only ONE stream issues atomized work, where it is a guaranteed
+  no-op. It **fails safe**: the instant a second stream appears the fast path
+  latches off permanently, so no window exists where two streams both skip it
+  (verified with 4- and 8-stream concurrent atomized workloads);
+* **redundant metadata writes** are elided — consecutive launches requesting the
+  same `[lo,hi)` (e.g. back-to-back single-atom launches, which all want the full
+  grid) skip the two `cuMemsetD32Async` calls. Disabled during capture and once
+  multiple streams are active.
+
+Net: atomizer **5.02 → 2.84 µs** (−43 %), default path **12.4 → 5.93 µs** (−52 %).
+
+### Module load + splice (one-time, per module)
+
+The splicer is a **single pass**: it plans every insertion, does one segmented copy
+into a correctly-sized buffer, and fixes all headers once. Only file offsets
+(section/program headers) accumulate across insertions — symbol `st_value`,
+`.nv.info` instruction offsets and relocation `r_offset`s are section-relative, so
+each kernel shifts by just its own prologue.
+
+| kernels/module | splice time | (earlier one-at-a-time splicer) |
+|---|---|---|
+| 75 | 0.03 ms | 1.03 ms — **34× slower** |
+| 150 | 0.08 ms | 3.48 ms — 44× |
+| 300 | 0.13 ms | 14.1 ms — 109× |
+| **600** | **0.33 ms** | **92.1 ms — 279×** |
+
+Scaling is now **linear** (~2× per doubling; it was ~4×, i.e. quadratic, when each
+kernel re-copied the whole cubin). Getting there also meant removing three
+`O(sections × kernels)` lookups: the kernel-entry test now precomputes a
+section→symbol map in one pass, offset-shift counts use binary search over the
+sorted insertion list, and name→kernel lookups use a sorted index.
+
+Whole-module load, including the driver's own work:
+
+| module | baseline load | with splice | note |
+|---|---|---|---|
+| 1 kernel | 10.8 µs | 18.5 µs | +7.7 µs |
+| 600 kernels | 1.40 ms | 8.76 ms | of which **only 0.33 ms is LithOS** |
+
+The remaining gap at 600 kernels is the **driver** loading a larger module: the
+spliced cubin grows 841 KB → 1149 KB (600 × 512-byte prologues), and that
+relocation/load cost is inherent to the approach, not something the splicer can
+avoid.
+
+### CUDA graph replay
+
+| mode | µs/replay | Δ |
+|---|---|---|
+| baseline | 18.9 | — |
+| interpose only | 19.3 | **+2 %** |
+| atomize-in-graph (default) | 39.0 | +106 % |
+| **subgraph K=4** (paper model) | 21.2 | **+12 %** |
+
+Unchanged conclusion: in-graph atomization roughly doubles replay cost (it adds
+metadata nodes per kernel, and node writes cannot be elided during capture —
+every one must be *recorded*), while the subgraph model stays cheap. See §2 for
+the full graph analysis and the reallocation cost.
+
+### Reading these numbers
+
+* **Interposition is nearly free** (+0.6 µs) — TPC scheduling costs almost nothing
+  on the launch critical path.
+* **The predictor dominates the default path** (+3.6 µs), and it is on by default.
+  It uses one event per launch; per-task tracking is *not* sampled because the
+  paper's Tracker signal also clears the sync queues and updates stealing timers.
+  Set `LITHOS_PREDICT=0` for the ~1 µs atomizer-only cost.
+* **All of this is amortized against real work.** For ML kernels (ms-scale) a few
+  µs is noise; it only matters when flooding tiny kernels.
 
 ---
 

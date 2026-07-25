@@ -53,6 +53,7 @@ int atomizer_dispatch_coop(CUfunction f, unsigned gx, unsigned gy, unsigned gz,
  * function drives the per-atom launches and metadata updates. */
 int atomizer_dispatch(LithosKernel* k, int quota_tpcs);
 void atomizer_set_ex_pred(double us);   /* predicted us for the next Ex dispatch (§5.7) */
+void atomizer_set_capture_hint(int capturing); /* -1 = unknown; avoids a duplicate cuStreamIsCapturing */
 
 /* Compute the number of atoms from a predicted duration and atom_duration. */
 int atomizer_num_atoms(const LithosKernel* k, double pred_us);

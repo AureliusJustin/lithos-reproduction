@@ -29,12 +29,47 @@ static OpPred g_tab[P_STREAMS][/*P_OPS*/ 2048];
 static int    g_op_idx[P_STREAMS];
 static pthread_mutex_t g_pmtx = PTHREAD_MUTEX_INITIALIZER;
 
-/* pending measurements (ring) the tracker reaps */
-typedef struct { int slot, op, tpcs; CUevent a, b; int used; } Pend;
+/* Pending measurements (ring) the Tracker reaps.
+ *
+ * ONE event per launch, recorded AFTER it: the event marks that launch's
+ * COMPLETION. Because a stream executes its launches serially, a kernel's
+ * duration is the gap between its own completion and the previous one on the same
+ * launch queue:  duration(k) = completion(k) - completion(k-1).
+ *
+ * That halves the per-launch event cost versus bracketing each kernel with a
+ * start/stop pair, while still tracking EVERY task's completion — which the paper
+ * requires, since the same Tracker signal clears the sync queues (the
+ * outstanding-work throttle) and updates the stealing timers, not just the
+ * predictor ("as tasks complete, sync queues are cleared and timers updated,
+ * potentially refining predictions", §5.3/§5.7).
+ *
+ * The previous completion event is held per slot in g_prev_evt. It is dropped at
+ * a sync/batch boundary so the first kernel of a new batch never measures the
+ * idle gap across the sync. */
+typedef struct {
+    int     slot, op, tpcs;
+    unsigned gen;        /* batch generation this launch belongs to */
+    CUevent done_evt;
+    int     used;
+} Pend;
 #define P_PEND 4096
 static Pend g_pend[P_PEND];
 static int  g_pend_head, g_pend_tail;
 static pthread_mutex_t g_pendmtx = PTHREAD_MUTEX_INITIALIZER;
+
+/* Batch generation per launch queue, bumped by predict_reset_op at every sync.
+ * Each launch is tagged with the generation current when it was submitted, so the
+ * Tracker can tell whether two consecutive completions belong to the SAME batch.
+ * Differencing is only valid within a batch: across a sync the gap is idle time,
+ * not kernel time. Tagging (rather than a "skip next" flag) is exact regardless of
+ * how far the Tracker lags behind the app. */
+static volatile unsigned g_batch_gen[P_STREAMS];
+
+/* The previous completion on each queue — the reference for the next delta —
+ * together with its generation. Owned by the Tracker thread. */
+static CUevent  g_prev_evt[P_STREAMS];
+static unsigned g_prev_gen[P_STREAMS];
+static int      g_prev_valid[P_STREAMS];
 
 /* event pool */
 #define P_EVPOOL 256
@@ -59,7 +94,15 @@ int predict_next_op(int slot) {
     g_op_idx[slot] = k + 1;
     return k;
 }
-void predict_reset_op(int slot) { if (slot >= 0 && slot < P_STREAMS) g_op_idx[slot] = 0; }
+/* A sync ends the batch. Reset the ordinal AND drop this queue's completion
+ * reference: the next batch's first kernel must not measure the idle gap across
+ * the sync. (The event object is leaked back to the pool lazily by the Tracker if
+ * it is still in flight; marking it stale here is enough for correctness.) */
+void predict_reset_op(int slot) {
+    if (slot < 0 || slot >= P_STREAMS) return;
+    g_op_idx[slot] = 0;
+    __atomic_add_fetch(&g_batch_gen[slot], 1, __ATOMIC_RELAXED);   /* new batch */
+}
 
 double predict_lookup(int slot, int op, int tpcs, uint64_t blocks) {
     if (slot < 0 || slot >= P_STREAMS || op < 0 || op >= P_OPS || tpcs < 1) return 0;
@@ -121,6 +164,50 @@ static void predict_record(int slot, int op, int tpcs, double us) {
                 slot, op, tpcs, us, ema, seen);
 }
 
+/* ---- capture guard -------------------------------------------------------
+ * CUDA stream capture is fragile: while a thread is between cuStreamBeginCapture
+ * and cuStreamEndCapture, CUDA calls issued on the same context from OTHER threads
+ * (our Tracker's cuEventQuery / cuEventCreate / cuEventDestroy) can invalidate the
+ * capture ("operation failed due to a previous error during capture") or crash it.
+ * sched.c raises this flag around capture so the Tracker parks itself; the pending
+ * measurements simply stay queued and are reaped afterwards. */
+/* A simple flag is NOT enough: the Tracker could test it, be descheduled, and then
+ * issue its CUDA calls after a capture has opened. So capture_begin also WAITS for
+ * the Tracker to leave any in-progress CUDA section (g_track_busy), and the
+ * Tracker only enters that section while no capture is open. Both sides take
+ * g_capmtx, which makes the two states mutually exclusive. */
+static int             g_capture_active = 0;   /* open captures (guarded by g_capmtx) */
+static int             g_track_busy     = 0;   /* Tracker inside CUDA calls           */
+static pthread_mutex_t g_capmtx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  g_capcv  = PTHREAD_COND_INITIALIZER;
+
+void predict_capture_begin(void) {
+    pthread_mutex_lock(&g_capmtx);
+    g_capture_active++;
+    while (g_track_busy) pthread_cond_wait(&g_capcv, &g_capmtx);  /* drain the Tracker */
+    pthread_mutex_unlock(&g_capmtx);
+}
+void predict_capture_end(void) {
+    pthread_mutex_lock(&g_capmtx);
+    if (g_capture_active > 0) g_capture_active--;
+    pthread_cond_broadcast(&g_capcv);
+    pthread_mutex_unlock(&g_capmtx);
+}
+/* Try to enter the Tracker's CUDA section; 0 means "a capture is open, back off". */
+static int track_enter(void) {
+    pthread_mutex_lock(&g_capmtx);
+    if (g_capture_active > 0) { pthread_mutex_unlock(&g_capmtx); return 0; }
+    g_track_busy = 1;
+    pthread_mutex_unlock(&g_capmtx);
+    return 1;
+}
+static void track_leave(void) {
+    pthread_mutex_lock(&g_capmtx);
+    g_track_busy = 0;
+    pthread_cond_broadcast(&g_capcv);
+    pthread_mutex_unlock(&g_capmtx);
+}
+
 /* ---- event pool ---- */
 CUevent predict_evt_get(void) {
     CUevent e = NULL;
@@ -137,18 +224,31 @@ static void evt_put(CUevent e) {
     pthread_mutex_unlock(&g_evmtx);
 }
 
-void predict_submit(int slot, int op, int tpcs, CUevent a, CUevent b) {
-    if (!a || !b) { evt_put(a); evt_put(b); return; }
-    /* estimate the work now so the throttle sees it immediately; corrected on reap */
+/* Queue one launch's completion event for the Tracker. `done_evt` must already
+ * have been recorded on the launch stream AFTER the launch. */
+void predict_submit(int slot, int op, int tpcs, CUevent done_evt) {
+    if (!done_evt) return;
+    /* Credit the estimated work immediately so the throttle sees this launch as
+     * in flight right away; the estimate is corrected when the event is reaped. */
     double est = predict_lookup(slot, op, tpcs, 0);
-    if (est <= 0) est = 20.0;   /* unknown: assume ~20us in flight */
+    if (est <= 0) est = 20.0;   /* unknown operator: assume ~20 us in flight */
+
     pthread_mutex_lock(&g_pendmtx);
-    int nxt = (g_pend_head + 1) % P_PEND;
-    if (nxt == g_pend_tail) { pthread_mutex_unlock(&g_pendmtx); evt_put(a); evt_put(b); return; }
-    g_pend[g_pend_head] = (Pend){slot, op, tpcs, a, b, 1};
-    g_pend_head = nxt;
+    int next = (g_pend_head + 1) % P_PEND;
+    if (next == g_pend_tail) {          /* ring full: drop this measurement */
+        pthread_mutex_unlock(&g_pendmtx);
+        evt_put(done_evt);
+        return;
+    }
+    unsigned gen = (slot >= 0 && slot < P_STREAMS)
+                 ? __atomic_load_n(&g_batch_gen[slot], __ATOMIC_RELAXED) : 0;
+    g_pend[g_pend_head] = (Pend){ slot, op, tpcs, gen, done_evt, 1 };
+    g_pend_head = next;
     pthread_mutex_unlock(&g_pendmtx);
-    pthread_mutex_lock(&g_pmtx); g_outstanding_us += est; pthread_mutex_unlock(&g_pmtx);
+
+    pthread_mutex_lock(&g_pmtx);
+    g_outstanding_us += est;
+    pthread_mutex_unlock(&g_pmtx);
 }
 
 double predict_outstanding_us(void) {
@@ -164,16 +264,49 @@ static int reap_one(void) {
     Pend p = g_pend[g_pend_tail];
     pthread_mutex_unlock(&g_pendmtx);
     if (!p.used) return 0;
-    if (cuEventQuery(p.b) != CUDA_SUCCESS) return 0;   /* not finished; try later */
-    float ms = 0; double us = 0;
-    if (cuEventElapsedTime(&ms, p.a, p.b) == CUDA_SUCCESS) us = ms * 1000.0;
-    predict_record(p.slot, p.op, p.tpcs, us);
-    double est = predict_lookup(p.slot, p.op, p.tpcs, 0); if (est <= 0) est = 20.0;
+
+    /* Enter the CUDA section: refuses (and we back off) while a capture is open,
+     * and blocks capture_begin from returning until we leave. */
+    if (!track_enter()) return 0;
+
+    /* Has this launch finished? If not, leave it queued and retry later. */
+    if (cuEventQuery(p.done_evt) != CUDA_SUCCESS) { track_leave(); return 0; }
+
+    /* Duration = time since the PREVIOUS completion on this launch queue. With no
+     * predecessor (first kernel of a batch) we can't derive a duration, but the
+     * completion itself still counts — this event simply becomes the reference
+     * for the next one. */
+    int valid_slot = (p.slot >= 0 && p.slot < P_STREAMS);
+    if (valid_slot && g_prev_valid[p.slot]) {
+        /* Only difference against the previous completion if it belongs to the
+         * SAME batch — otherwise the gap spans a sync and is idle time. */
+        if (g_prev_gen[p.slot] == p.gen) {
+            float ms = 0;
+            if (cuEventElapsedTime(&ms, g_prev_evt[p.slot], p.done_evt) == CUDA_SUCCESS && ms >= 0)
+                predict_record(p.slot, p.op, p.tpcs, ms * 1000.0);
+        }
+        evt_put(g_prev_evt[p.slot]);         /* recycle the old reference */
+    }
+    if (valid_slot) {
+        g_prev_evt[p.slot]   = p.done_evt;   /* becomes the next reference */
+        g_prev_gen[p.slot]   = p.gen;
+        g_prev_valid[p.slot] = 1;
+    } else {
+        evt_put(p.done_evt);
+    }
+    track_leave();   /* done with CUDA; a waiting capture may now proceed */
+
+    /* Release this launch's share of the outstanding-work counter (§5.3). */
+    double est = predict_lookup(p.slot, p.op, p.tpcs, 0);
+    if (est <= 0) est = 20.0;
     pthread_mutex_lock(&g_pmtx);
-    g_outstanding_us -= est; if (g_outstanding_us < 0) g_outstanding_us = 0;
+    g_outstanding_us -= est;
+    if (g_outstanding_us < 0) g_outstanding_us = 0;
     pthread_mutex_unlock(&g_pmtx);
-    evt_put(p.a); evt_put(p.b);
-    pthread_mutex_lock(&g_pendmtx); g_pend_tail = (g_pend_tail + 1) % P_PEND; pthread_mutex_unlock(&g_pendmtx);
+
+    pthread_mutex_lock(&g_pendmtx);
+    g_pend_tail = (g_pend_tail + 1) % P_PEND;
+    pthread_mutex_unlock(&g_pendmtx);
     return 1;
 }
 

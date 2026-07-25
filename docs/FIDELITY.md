@@ -20,7 +20,7 @@ Legend: ✅ faithful · ≈ divergent (same goal, different mechanism) · ◑ si
 | Deployment | native + **containers** | `LD_PRELOAD` or `libcuda.so.1` wrapper; containers untested | ◑ |
 | TPC masking (QMD) | reverse-engineered; Ampere, **Hopper**, Ada; extends libsmctrl | reverse-engineered; **Ampere only** tested (Hopper offsets present, untested) | ◑ |
 | Compute quotas | guaranteed TPCs per tenant | `LITHOS_QUOTA` → QMD mask, verified | ✅ |
-| TPC stealing | idle tenants lend TPCs | implemented (timestamp idle-detection) | ◑ |
+| TPC stealing | idle **applications** lend TPCs to busy ones | implemented + tested (`tests/test_stealing.c`), but **intra-process only**: it can lend between *streams*, not tenants. Needs `LITHOS_PERSTREAM_QUOTA=1` to give streams disjoint ranges — with the paper's one-quota-per-application model every stream shares a range and lending is a provable no-op | ◑ |
 | Launch queues / dispatcher | per-stream queues + dispatcher/tracker threads (Fig. 9) | per-stream launch queues; a **Tracker thread** reaps completions; a **Dispatcher thread** submits launches (`LITHOS_DISPATCH`, opt-in — a hand-off, since a transparent interposer can't safely snapshot `cuLaunchKernel`'s implicit-size args) | ◑→✅ |
 | Outstanding-work throttle | 100 µs sync-queue throttle, event reaping | **enforced** (`LITHOS_THROTTLE`): defers dispatch until event-reaped in-flight µs < limit | ✅ |
 | Duration predictor | a predictor (§5.7) | **online event-measured, operator-indexed** (ordinal k per launch queue, reset on sync), EMA-refined, TPC-scaled | ✅ |
@@ -128,7 +128,14 @@ The scheduler beyond quotas/stealing — previously stubbed — is now reproduce
 - **Tracker thread + outstanding-work throttle (§5.3)** (`LITHOS_THROTTLE`). A
   Tracker thread reaps completion events, feeds the predictor, and maintains the
   in-flight-µs counter; dispatch is deferred while it exceeds the limit (paper:
-  100 µs).
+  100 µs). Per the paper, completion is tracked for **every** task — the same
+  signal clears the sync queues and updates the stealing timers, so it is not
+  sampled. Measurement uses **one event per launch** (a completion marker;
+  duration = gap to the previous completion on that queue), not a start/stop pair.
+  *Placement caveat:* the paper throttles inside the **dispatcher**, which we match
+  when `LITHOS_DISPATCH=1`; with the dispatcher off there is no separate thread to
+  defer on, so the calling thread waits instead. The policy is the same; only where
+  the wait happens differs.
 - **Dispatcher thread / launch queues (§5.2)** (`LITHOS_DISPATCH`, opt-in). Launches
   funnel through one dispatcher thread that applies global policy and submits to the
   GPU. It's a *hand-off* (the app thread waits until the dispatcher consumes the

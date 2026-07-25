@@ -86,6 +86,7 @@ typedef struct LithosConfig {
     double   latency_slip;        /* LITHOS_SLIP: right-sizing latency-slip factor k    */
     int      throttle;            /* LITHOS_THROTTLE: enforce the outstanding-work limit */
     int      dispatch;            /* LITHOS_DISPATCH: route launches through a dispatcher thread (§5.2) */
+    int      perstream_quota;     /* LITHOS_PERSTREAM_QUOTA: give each stream its own disjoint TPC slice */
     int      enable_jump;         /* attempt the Prelude->original transfer      */
     int      use_brx;             /* 1 = patch CALL->BRX jump; 0 = keep the CALL  */
     int      verbose;

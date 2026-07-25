@@ -38,6 +38,7 @@
 #include <pthread.h>
 #include <elf.h>
 #include <unistd.h>
+#include <time.h>
 #include "atomizer.h"
 #include "qmd.h"
 #include "real.h"
@@ -51,6 +52,12 @@ int atomize_build_prologue(int sm_major, int sm_minor, uint64_t meta_va,
 int atomize_splice_cubin(const void* cubin, size_t sz, const unsigned char* pro,
                          size_t prolen, void** out, size_t* outsz,
                          char*** names_out, int* n_names_out);
+
+/* Wall-clock helper for the LITHOS_DIAG splice timing below. */
+static double az_now_ms(void) {
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1e3 + t.tv_nsec / 1e6;
+}
 /* fatbin.c: turn an ELF/fatbin/PTX image into a raw cubin (0 ok, -1 = verbatim).
  * *out==image with *outsz==0 means "already a cubin"; otherwise *out is malloc'd. */
 int atomize_image_to_cubin(const void* image, int want_sm, void** out, size_t* outsz);
@@ -58,48 +65,132 @@ int atomize_image_to_cubin(const void* image, int want_sm, void** out, size_t* o
 /* ------------------------------------------------------------------ */
 /*  Shared metadata buffer + prologue (one per process)               */
 /* ------------------------------------------------------------------ */
-static CUdeviceptr    g_meta;             /* device {lo,hi} the prologue reads   */
-static CUevent        g_atom_ev;          /* cross-stream serialization of g_meta */
-static int            g_atom_ev_valid;
-static unsigned char* g_prologue;         /* range-check SASS (padded)           */
-static size_t         g_prolen;
-static int            g_prologue_ready;
-static int            g_dev_sm;           /* running device SM (e.g. 86)         */
-static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;
-/* predicted duration for the NEXT Ex dispatch on this thread (set by sched.c) */
+/* The spliced-in prologue reads AtomMetadata{lo,hi} from ONE fixed device address
+ * (its VA is baked into the prologue's SASS as a literal), so there is exactly one
+ * metadata buffer per process. Before each atom's relaunch we write that atom's
+ * [lo,hi) there, stream-ordered ahead of the launch. */
+static CUdeviceptr     g_meta;            /* device AtomMetadata{lo,hi}            */
+static CUevent         g_atom_ev;         /* orders g_meta writes across streams   */
+static int             g_atom_ev_valid;   /* has g_atom_ev been recorded yet?      */
+static unsigned char*  g_prologue;        /* the range-check SASS bytes (padded)   */
+static size_t          g_prolen;          /* its length                            */
+static int             g_prologue_ready;  /* prologue + g_meta built?              */
+static int             g_dev_sm;          /* running device SM, e.g. 86            */
+static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;   /* guards all of the above */
+
+/* The Ex launch path has no LithosKernel to carry pred_us, so sched.c stashes the
+ * predicted duration here (per thread) just before calling atomizer_dispatch_ex. */
 static __thread double g_ex_pred_us = 0;
 void atomizer_set_ex_pred(double us) { g_ex_pred_us = us; }
 
+/* sched.c already has to know whether the stream is capturing, and
+ * cuStreamIsCapturing is a driver call — so it passes the answer down here rather
+ * than making us ask again. -1 means "unknown, look it up yourself". */
+static __thread int g_capture_hint = -1;
+void atomizer_set_capture_hint(int capturing) { g_capture_hint = capturing; }
+
 /* ------------------------------------------------------------------ */
-/*  Which loaded objects were successfully atomized                   */
+/*  Gating: which functions may be atomized                           */
 /* ------------------------------------------------------------------ */
-/* Per-container (CUmodule/CUlibrary) set of the kernel names we actually spliced
- * -- only those get gated at launch, so a module with one un-spliceable kernel
- * still atomizes the rest and the odd one runs verbatim. Functions/kernels
- * resolved from a container are gated by NAME membership. */
+/* Every launched function falls into one of three classes, and getting this right
+ * is what keeps results correct when a module is only partially spliceable:
+ *
+ *   ATOM     the function's kernel WAS spliced, so it carries the range-check and
+ *            may be split into atoms (we set [lo,hi) per atom).
+ *   FULL     the function came from a module we spliced, but this kernel's name
+ *            wasn't in the spliced set (splice-skipped, or a handle we couldn't
+ *            match by name). It MAY still carry a prologue, so it must be launched
+ *            with an explicit FULL range — otherwise it would read whatever [lo,hi)
+ *            the previous atom left in g_meta and silently drop blocks.
+ *   VERBATIM the function is from an un-spliced module: launch it untouched.
+ *
+ * We record membership by handle. Containers (CUmodule/CUlibrary) remember the
+ * kernel NAMES we spliced, and functions resolved from them are classified by name.
+ */
 #define MAX_MODS  8192
 #define MAX_FUNCS 262144
-typedef struct { void* handle; char** names; int n; } Container;
-static Container  g_containers[MAX_MODS]; static int g_containers_n;
-static void*      g_atom_funcs[MAX_FUNCS]; static int g_atom_funcs_n;  /* spliced -> split */
-/* Functions resolved from an atomized module whose NAME wasn't in the spliced set
- * (splice-skipped, or a handle/name we couldn't match). They may still carry the
- * range-check prologue, so before launching them we write a serialized FULL range
- * to g_meta -- otherwise they'd read a previous atom's stale [lo,hi] and drop
- * blocks. This closes the shared-metadata hole for imperfect gating. */
-static void*      g_full_funcs[MAX_FUNCS]; static int g_full_funcs_n;
+
+typedef struct {
+    void*  handle;    /* CUmodule or CUlibrary                        */
+    char** names;     /* kernel names successfully spliced in it      */
+    int    n;
+} Container;
 typedef struct SplicedNames { char** names; int n; } SplicedNames;
 
-/* Atomization coverage stats (LITHOS_STATS=1 dumps them at exit). */
-static int handle_in(void** set, int n, void* h);
-static long g_st_split, g_st_atom1, g_st_full, g_st_verbatim;
-static void* g_verb_funcs[MAX_FUNCS]; static int g_verb_funcs_n; /* distinct un-atomized funcs */
+static Container g_containers[MAX_MODS];
+static int       g_containers_n;
+
+static void* g_atom_funcs[MAX_FUNCS];   /* class ATOM: spliced -> may be split   */
+static int   g_atom_funcs_n;
+static void* g_full_funcs[MAX_FUNCS];   /* class FULL: force the full range      */
+static int   g_full_funcs_n;
+static void* g_verb_funcs[MAX_FUNCS];   /* class VERBATIM: distinct un-atomized  */
+static int   g_verb_funcs_n;
+
+/* ---- pointer hash set -----------------------------------------------------
+ * Function handles are looked up on EVERY launch, and a big app can register a
+ * lot of them (TensorRT loads 11k+ kernels), so the membership test is open-
+ * addressed rather than a linear scan: O(1) instead of O(n).
+ *
+ * The table is sized to the next power of two above MAX_FUNCS*2 so it never
+ * exceeds 50% load, which keeps probe chains short. Entries are only ever added
+ * (a module's kernels stay registered for the process lifetime), so there is no
+ * deletion/tombstone handling to get wrong. */
+#define FSET_BITS 20                      /* 1M slots for up to 262k entries */
+#define FSET_SIZE (1u << FSET_BITS)
+#define FSET_MASK (FSET_SIZE - 1)
+
+typedef struct { void** slot; } FuncSet;  /* open-addressed table of pointers */
+
+/* Fibonacci hashing: multiply by 2^64/phi and take the high bits. Handles are
+ * allocator pointers whose low bits are mostly alignment zeros, so the high bits
+ * of the product mix far better than a plain mask of the address. */
+static inline unsigned fset_hash(void* h) {
+    return (unsigned)(((uintptr_t)h * 11400714819323198485ull) >> (64 - FSET_BITS));
+}
+static int fset_has(void** table, void* h) {
+    unsigned i = fset_hash(h);
+    for (;;) {
+        void* cur = table[i];
+        if (!cur)     return 0;           /* empty slot: not present */
+        if (cur == h) return 1;
+        i = (i + 1) & FSET_MASK;          /* linear probe */
+    }
+}
+static void fset_add(void** table, void* h) {
+    unsigned i = fset_hash(h);
+    for (;;) {
+        void* cur = table[i];
+        if (cur == h) return;             /* already present */
+        if (!cur) { table[i] = h; return; }
+        i = (i + 1) & FSET_MASK;
+    }
+}
+
+/* Membership tables, parallel to the g_*_funcs arrays (which stay as the ordered
+ * record used for stats). Allocated lazily so a process that never atomizes pays
+ * nothing. */
+static void** g_atom_set;
+static void** g_full_set;
+static void** g_verb_set;
+static void** fset_alloc(void) { return calloc(FSET_SIZE, sizeof(void*)); }
+
+
+/* ------------------------------------------------------------------ */
+/*  Coverage statistics (LITHOS_STATS=1 dumps them at exit)           */
+/* ------------------------------------------------------------------ */
 static void stats_tick(void);
+
+static long g_st_split;      /* launches split into >1 atom      */
+static long g_st_atom1;      /* gated launches that stayed 1 atom */
+static long g_st_full;       /* launches forced to the full range */
+static long g_st_verbatim;   /* launches passed through untouched */
 static void stat_verbatim(void* f) {
     __atomic_fetch_add(&g_st_verbatim, 1, __ATOMIC_RELAXED);
     pthread_mutex_lock(&g_mtx);
-    if (!handle_in(g_verb_funcs, g_verb_funcs_n, f) && g_verb_funcs_n < MAX_FUNCS)
-        g_verb_funcs[g_verb_funcs_n++] = f;
+    if (!g_verb_set) g_verb_set = fset_alloc();
+    if (g_verb_set && !fset_has(g_verb_set, f)) { fset_add(g_verb_set, f); if (g_verb_funcs_n < MAX_FUNCS)
+        g_verb_funcs[g_verb_funcs_n++] = f; }
     pthread_mutex_unlock(&g_mtx);
     stats_tick();
 }
@@ -132,10 +223,6 @@ __attribute__((destructor)) static void atom_stats_dump(void) {
     write_stats_file();
 }
 
-static int handle_in(void** set, int n, void* h) {
-    for (int i = 0; i < n; i++) if (set[i] == h) return 1;
-    return 0;
-}
 static Container* find_container(void* h) {
     for (int i = 0; i < g_containers_n; i++) if (g_containers[i].handle == h) return &g_containers[i];
     return NULL;
@@ -145,12 +232,18 @@ static int names_have(char** names, int n, const char* name) {
     return 0;
 }
 static void add_atom_func(void* h) {
-    if (!handle_in(g_atom_funcs, g_atom_funcs_n, h) && g_atom_funcs_n < MAX_FUNCS)
-        g_atom_funcs[g_atom_funcs_n++] = h;
+    if (!g_atom_set) g_atom_set = fset_alloc();
+    if (!g_atom_set) return;
+    if (fset_has(g_atom_set, h)) return;
+    if (g_atom_funcs_n < MAX_FUNCS) g_atom_funcs[g_atom_funcs_n++] = h;
+    fset_add(g_atom_set, h);
 }
 static void add_full_func(void* h) {
-    if (!handle_in(g_full_funcs, g_full_funcs_n, h) && g_full_funcs_n < MAX_FUNCS)
-        g_full_funcs[g_full_funcs_n++] = h;
+    if (!g_full_set) g_full_set = fset_alloc();
+    if (!g_full_set) return;
+    if (fset_has(g_full_set, h)) return;
+    if (g_full_funcs_n < MAX_FUNCS) g_full_funcs[g_full_funcs_n++] = h;
+    fset_add(g_full_set, h);
 }
 
 void atomizer_init(void) {
@@ -215,7 +308,11 @@ int atomizer_intercept_cubin(const void* image, void** out, size_t* outsz,
 
     pthread_mutex_lock(&g_mtx);
     void* spl = NULL; size_t splz = 0; char** nm = NULL; int nn = 0;
+    double t_splice0 = az_now_ms();
     int rc = atomize_splice_cubin(cub, cubsz, g_prologue, g_prolen, &spl, &splz, &nm, &nn);
+    if (getenv("LITHOS_DIAG"))
+        fprintf(stderr, "[diag] splice: %d kernels, %.2f ms (cubin %zu -> %zu bytes)\n",
+                nn, az_now_ms() - t_splice0, cubsz, splz);
     pthread_mutex_unlock(&g_mtx);
     if (!cub_is_image) free(cub);
     if (rc != 0 || !spl) return 0;                   /* nothing spliced: load verbatim */
@@ -273,17 +370,17 @@ void atomizer_note_get_kernel(CUkernel k, CUlibrary lib, const char* name) {
 /* kernel -> function (cuKernelGetFunction): inherit the kernel handle's class. */
 void atomizer_note_kernel_function(CUfunction f, CUkernel k) {
     pthread_mutex_lock(&g_mtx);
-    if (handle_in(g_atom_funcs, g_atom_funcs_n, (void*)k)) add_atom_func(f);
-    else if (handle_in(g_full_funcs, g_full_funcs_n, (void*)k)) add_full_func(f);
+    if (g_atom_set && fset_has(g_atom_set, (void*)k)) add_atom_func(f);
+    else if (g_full_set && fset_has(g_full_set, (void*)k)) add_full_func(f);
     pthread_mutex_unlock(&g_mtx);
 }
 
 static int is_atomized_func(CUfunction f) {
-    return handle_in(g_atom_funcs, g_atom_funcs_n, (void*)f);
+    return g_atom_set && fset_has(g_atom_set, (void*)f);
 }
 /* From an atomized module but not individually gated -> force full-range meta. */
 static int is_full_func(CUfunction f) {
-    return handle_in(g_full_funcs, g_full_funcs_n, (void*)f);
+    return g_full_set && fset_has(g_full_set, (void*)f);
 }
 
 /* Number of atoms = ceil(predicted_duration / atom_duration), clamped to
@@ -319,9 +416,27 @@ int atomizer_num_atoms(const LithosKernel* k, double pred_us) {
  * so a captured atom subgraph REPLAYS the correct range -- no host staging, no
  * per-atom persistent buffers, no stale-value hazard. Works identically for
  * eager launches and graph capture. */
+/* Last range written to g_meta, so a redundant write can be skipped. Valid only
+ * while a single stream is doing atomized work and we are not capturing: with
+ * several streams the interleaving is decided by the GPU, and during capture the
+ * write must be *recorded* as a node every time even if the value repeats. */
+static uint32_t g_meta_lo, g_meta_hi;
+static int      g_meta_known;
+
 static void meta_write(CUstream s, uint32_t lo, uint32_t hi) {
     cuMemsetD32Async(g_meta,     lo, 1, s);
     cuMemsetD32Async(g_meta + 4, hi, 1, s);
+    g_meta_lo = lo; g_meta_hi = hi; g_meta_known = 1;
+}
+
+/* Write the range only if the buffer does not already hold it. Saves two driver
+ * calls on the common path where consecutive launches use the same range — e.g.
+ * back-to-back single-atom (n=1) launches, which all request the full grid.
+ * `cacheable` is 0 during capture or once multiple streams are in play. */
+static void meta_write_cached(CUstream s, uint32_t lo, uint32_t hi, int cacheable) {
+    if (cacheable && g_meta_known && g_meta_lo == lo && g_meta_hi == hi) return;
+    meta_write(s, lo, hi);
+    if (!cacheable) g_meta_known = 0;   /* value may be reordered/replayed: forget it */
 }
 
 /* The atom range lives in a single per-process device buffer (g_meta), so two
@@ -335,19 +450,44 @@ static void meta_write(CUstream s, uint32_t lo, uint32_t hi) {
  * is self-ordered, and waiting on an event recorded outside the capture is
  * illegal). Caller holds g_mtx. */
 static int stream_capturing(CUstream s) {
+    if (g_capture_hint >= 0) return g_capture_hint;   /* sched.c already asked */
     if (!g_real.cuStreamIsCapturing) return 0;
     CUstreamCaptureStatus st = CU_STREAM_CAPTURE_STATUS_NONE;
     if (g_real.cuStreamIsCapturing(s, &st) != CUDA_SUCCESS) return 0;
     return st == CU_STREAM_CAPTURE_STATUS_ACTIVE;
 }
 
-static int atom_serial_begin(CUstream s) {
-    int cap = stream_capturing(s);
-    if (!cap && g_atom_ev_valid) cuStreamWaitEvent(s, g_atom_ev, 0);
-    return cap;
+/* Cross-stream serialization is only needed once MORE THAN ONE stream issues
+ * atomized launches: with a single stream the launches are already ordered, so the
+ * wait/record pair is a guaranteed no-op that still costs two driver calls.
+ *
+ * We therefore track the first stream we see and stay on a fast path until a
+ * second one appears. This FAILS SAFE: the moment a second stream shows up the
+ * fast path is disabled permanently (g_multi_stream latches), and the very first
+ * launch on that new stream takes the slow path, so no window exists where two
+ * streams both skip serialization. Single-stream inference — the common case —
+ * then pays nothing, while multi-stream frameworks (JAX/XLA) keep full ordering. */
+static CUstream g_first_atom_stream;
+static int      g_have_first_stream;
+static int      g_multi_stream;          /* latched: never returns to the fast path */
+
+/* Returns 1 if this launch may skip the wait/record pair. Caller holds g_mtx. */
+static int serial_can_skip(CUstream s) {
+    if (g_multi_stream) return 0;
+    if (!g_have_first_stream) { g_first_atom_stream = s; g_have_first_stream = 1; return 1; }
+    if (g_first_atom_stream == s) return 1;
+    g_multi_stream = 1;                  /* a second stream: serialize from now on */
+    g_meta_known   = 0;                  /* the cached range is no longer trustworthy */
+    return 0;
 }
-static void atom_serial_end(CUstream s, int cap) {
-    if (!cap && g_atom_ev) { cuEventRecord(g_atom_ev, s); g_atom_ev_valid = 1; }
+
+/* `capturing` is passed in by the caller, which already had to determine it —
+ * this avoids a second cuStreamIsCapturing driver call per launch. */
+static void atom_serial_begin_ex(CUstream s, int capturing, int skip) {
+    if (!capturing && !skip && g_atom_ev_valid) cuStreamWaitEvent(s, g_atom_ev, 0);
+}
+static void atom_serial_end_ex(CUstream s, int capturing, int skip) {
+    if (!capturing && !skip && g_atom_ev) { cuEventRecord(g_atom_ev, s); g_atom_ev_valid = 1; }
 }
 
 static int launch_original(LithosKernel* k) {
@@ -359,44 +499,76 @@ static int launch_original(LithosKernel* k) {
     return 1;
 }
 
+/* The main atomization path (cuLaunchKernel). Splits the grid into N contiguous
+ * block ranges and relaunches the UNMODIFIED grid once per range; the spliced-in
+ * prologue makes each launch execute only the blocks in the current [lo,hi).
+ * Returns the number of launches actually issued. */
 int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
     (void)quota_tpcs;
-    CUfunction f = (CUfunction)k->func;
-    uint64_t blocks = k->total_blocks;
-    CUstream s = (CUstream)k->stream;
+    CUfunction f      = (CUfunction)k->func;
+    uint64_t   blocks = k->total_blocks;
+    CUstream   s      = (CUstream)k->stream;
+
+    /* --- classes VERBATIM and FULL (see the gating comment near the top) --- */
     if (!is_atomized_func(f)) {
-        if (!is_full_func(f)) { stat_verbatim(f); return launch_original(k); }  /* verbatim */
-        /* spliced-but-ungated: serialized full-range so it never drops blocks */
+        if (!is_full_func(f)) {                 /* VERBATIM: not ours, pass through */
+            stat_verbatim(f);
+            return launch_original(k);
+        }
+        /* FULL: may carry a prologue but isn't individually gated, so pin the range
+         * to the whole grid before launching — never let it inherit a stale one. */
         pthread_mutex_lock(&g_mtx);
-        int cp = atom_serial_begin(s);
-        meta_write(s, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks));
+        int capturing = stream_capturing(s);
+        int skip = !capturing && serial_can_skip(s);
+        atom_serial_begin_ex(s, capturing, skip);
+        meta_write_cached(s, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks),
+                          skip && !capturing);
         launch_original(k);
-        atom_serial_end(s, cp);
+        atom_serial_end_ex(s, capturing, skip);
         pthread_mutex_unlock(&g_mtx);
-        __atomic_fetch_add(&g_st_full, 1, __ATOMIC_RELAXED); stats_tick();
+        __atomic_fetch_add(&g_st_full, 1, __ATOMIC_RELAXED);
+        stats_tick();
         return 1;
     }
 
-    int n = decide_atoms(blocks, k->pred_us);
-    uint64_t per = (blocks + n - 1) / n;
-    int launched = 0;
+    /* --- class ATOM: split the grid ---------------------------------------- */
+    int      n_atoms       = decide_atoms(blocks, k->pred_us);
+    uint64_t blocks_per_atom = (blocks + n_atoms - 1) / n_atoms;   /* ceil-divide */
+    int      launched      = 0;
+
     pthread_mutex_lock(&g_mtx);
-    int cap = atom_serial_begin(s);
-    for (int i = 0; i < n; i++) {
-        uint64_t lo = (uint64_t)i * per, hi = lo + per; if (hi > blocks) hi = blocks;
-        if (lo >= hi) break;
-        meta_write(s, (uint32_t)lo, (uint32_t)hi);
-        /* give THIS atom its own TPC allocation (distinct slice under
-           LITHOS_ATOM_TPC, else the stream quota mask) -- the QMD next-mask is
-           one-shot, so it must be re-set before every atom's launch */
-        lithos_apply_atom_mask(s, i, n);
+    /* g_meta is process-wide, so concurrent streams must not interleave their
+     * metadata writes; this serializes atomized launches across streams. With a
+     * single stream the launches are already ordered, so the pair is skipped
+     * (serial_can_skip); it is also skipped during graph capture. */
+    int capturing = stream_capturing(s);
+    int skip = !capturing && serial_can_skip(s);
+    atom_serial_begin_ex(s, capturing, skip);
+
+    for (int i = 0; i < n_atoms; i++) {
+        uint64_t lo = (uint64_t)i * blocks_per_atom;
+        uint64_t hi = lo + blocks_per_atom;
+        if (hi > blocks) hi = blocks;
+        if (lo >= hi) break;                     /* ragged tail: no blocks left */
+
+        /* Publish this atom's range, stream-ordered ahead of its launch. */
+        meta_write_cached(s, (uint32_t)lo, (uint32_t)hi, skip && !capturing);
+
+        /* Give THIS atom its own TPC allocation. The QMD next-mask is one-shot
+         * (consumed per launch), so it must be re-armed before every atom —
+         * that is also what makes distinct per-atom allocations possible. */
+        lithos_apply_atom_mask(s, i, n_atoms);
+
         launch_original(k);
         launched++;
     }
-    if (launched == 0) { launch_original(k); launched = 1; }
-    atom_serial_end(s, cap);
+    if (launched == 0) { launch_original(k); launched = 1; }   /* safety net */
+
+    atom_serial_end_ex(s, capturing, skip);
     pthread_mutex_unlock(&g_mtx);
-    __atomic_fetch_add(launched > 1 ? &g_st_split : &g_st_atom1, 1, __ATOMIC_RELAXED); stats_tick();
+
+    __atomic_fetch_add(launched > 1 ? &g_st_split : &g_st_atom1, 1, __ATOMIC_RELAXED);
+    stats_tick();
     AZLOG("atomized func %p: %d atom(s) over %lu blocks", (void*)f, launched, blocks);
     return launched;
 }
@@ -419,18 +591,21 @@ int atomizer_dispatch_ex(const CUlaunchConfig* cfg, CUfunction f, void** params,
     uint64_t per = (blocks + n - 1) / n;
     int launched = 0;
     pthread_mutex_lock(&g_mtx);
-    int cap = atom_serial_begin(s);
+    int cap  = stream_capturing(s);
+    int skip = !cap && serial_can_skip(s);
+    int cacheable = skip && !cap;
+    atom_serial_begin_ex(s, cap, skip);
     if (n <= 1) {
-        meta_write(s, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks));
+        meta_write_cached(s, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks), cacheable);
         g_real.cuLaunchKernelEx(cfg, f, params, extra); launched = 1;
     } else for (int i = 0; i < n; i++) {
         uint64_t lo = (uint64_t)i * per, hi = lo + per; if (hi > blocks) hi = blocks;
         if (lo >= hi) break;
-        meta_write(s, (uint32_t)lo, (uint32_t)hi);
+        meta_write_cached(s, (uint32_t)lo, (uint32_t)hi, cacheable);
         g_real.cuLaunchKernelEx(cfg, f, params, extra);
         launched++;
     }
-    atom_serial_end(s, cap);
+    atom_serial_end_ex(s, cap, skip);
     pthread_mutex_unlock(&g_mtx);
     __atomic_fetch_add(full ? &g_st_full : (launched > 1 ? &g_st_split : &g_st_atom1), 1, __ATOMIC_RELAXED); stats_tick();
     AZLOG("atomized (Ex) func %p: %d atom(s) over %lu blocks", (void*)f, launched, blocks);
@@ -446,10 +621,13 @@ int atomizer_dispatch_coop(CUfunction f, unsigned gx, unsigned gy, unsigned gz,
     if (is_atomized_func(f) || is_full_func(f)) {
         uint64_t blocks = (uint64_t)gx * gy * gz;
         pthread_mutex_lock(&g_mtx);
-        int cap = atom_serial_begin(stream);
-        meta_write(stream, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks));
+        int cap  = stream_capturing(stream);
+        int skip = !cap && serial_can_skip(stream);
+        atom_serial_begin_ex(stream, cap, skip);
+        meta_write_cached(stream, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks),
+                          skip && !cap);
         g_real.cuLaunchCooperativeKernel(f, gx, gy, gz, bx, by, bz, shmem, stream, params);
-        atom_serial_end(stream, cap);
+        atom_serial_end_ex(stream, cap, skip);
         pthread_mutex_unlock(&g_mtx);
         __atomic_fetch_add(&g_st_full, 1, __ATOMIC_RELAXED); stats_tick();
         return 1;

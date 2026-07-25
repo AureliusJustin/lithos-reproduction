@@ -1,7 +1,27 @@
 /*
- * QMD/TMD hook implementation. The callback registration mirrors libsmctrl
- * (Bakita, ../libsmctrl/libsmctrl.c) -- proven on this driver -- and the body
- * is extended for the Kernel Atomizer (program-address capture/patch).
+ * QMD/TMD hook — where LithOS actually controls which SMs a kernel may run on.
+ *
+ * WHAT A QMD IS. Every kernel launch is described to the GPU by a "Queue Meta
+ * Data" block (QMD, a.k.a. TMD on older chips): a few hundred bytes of packed
+ * fields holding the program address, grid/block dims, register count, shared-mem
+ * size, and — crucially for us — an **SM-disable mask**. The driver builds this
+ * block and uploads it to the hardware queue. There is no public API to set the
+ * mask, so we intercept the QMD *just before upload* and write it ourselves.
+ *
+ * HOW WE INTERCEPT. The driver exposes an internal CUPTI-style callback table via
+ * cuGetExportTable; subscribing to (domain 0xb, callback 0x1) invokes us with the
+ * QMD pointer immediately before it is uploaded. Both the table UUID and the
+ * subscribe/enable slot indices were reverse-engineered by libsmctrl (Bakita,
+ * ../libsmctrl/libsmctrl.c) and are reused here unchanged.
+ *
+ * THE FIELD OFFSETS below are QMD-version specific and were found empirically
+ * (see tests/probe_*.c and the technical report). They are the load-bearing magic
+ * of this file, so each is named and documented.
+ *
+ * Note (CUDA graphs): this callback fires ONCE per graph exec — at its first
+ * launch — because replays re-run a pre-compiled command buffer that bypasses the
+ * driver's per-node QMD path. So a graph's SM mask is baked at first launch and
+ * can only be changed by re-instantiating (see graphsched.c).
  */
 #define _GNU_SOURCE
 #include <cuda.h>
@@ -11,58 +31,105 @@
 #include <string.h>
 #include "qmd.h"
 
-/* Same callback identifiers libsmctrl extracted by tracing CUPTI. */
+/* The internal callback table's UUID, and the (domain, callback-id) pair that
+ * fires just before a QMD is uploaded — all as extracted by libsmctrl. */
 static const CUuuid callback_funcs_id = {{0x2c, (char)0x8e, 0x0a, (char)0xd8, 0x07, 0x10, (char)0xab, 0x4e, (char)0x90, (char)0xdd, 0x54, 0x71, (char)0x9f, (char)0xe5, (char)0xf7, 0x4b}};
-#define QMD_DOMAIN 0xb
+#define QMD_DOMAIN     0xb
 #define QMD_PRE_UPLOAD 0x1
 
-/* Ampere/Ada QMD (TMD ver < 0x40): SM-disable mask is at TMD+84/+88 (libsmctrl).
- * The program-address field offset is discovered empirically (see qmd_probe). */
+/* ---- QMD field offsets (bytes from the start of the QMD) -------------------
+ *
+ * The callback's in_params is a small struct: [size:4][...]; the QMD pointer is
+ * the 5th pointer-sized slot, so we require size >= 5 pointers and read slot 4. */
+#define CB_PARAMS_MIN_SLOTS 5
+#define CB_PARAMS_QMD_SLOT  4
+
+/* QMD version byte. <0x40 = Kepler2..Ampere/Ada (QMDV03_00 etc); >=0x40 = Hopper,
+ * which moved the mask fields and needs an extra enable bit. */
+#define QMD_VERSION_OFF 72
+#define QMD_VER_HOPPER  0x40
+
+/* SM-disable mask, Ampere/Ada (a 64-bit mask split across two 32-bit words; a SET
+ * bit DISABLES that TPC). Verified on GA102/GA100. */
+#define QMD_MASK_LO_OFF 84
+#define QMD_MASK_HI_OFF 88
+
+/* SM-disable mask, Hopper: moved, plus two "extended" words that must be set to
+ * all-ones and a top bit in word 0 that enables the masking feature at all. */
+#define QMD_H_MASK_LO_OFF 304
+#define QMD_H_MASK_HI_OFF 308
+#define QMD_H_EXT_LO_OFF  312
+#define QMD_H_EXT_HI_OFF  316
+#define QMD_H_ENABLE_BIT  0x80000000u
+
+/* Per-thread register allocation (Ampere/Ada QMDV03_00), byte 81. The atomizer
+ * raises this when a spliced kernel needs more registers than it declared. */
+#define QMD_REG_COUNT_OFF 81
+
+/* Program address (the kernel entry PC the launch jumps to). Discovered
+ * empirically; 0 until qmd_probe() locates it on this driver/arch. */
 int g_qmd_prog_addr_off = 0;
 
-/* valid TPC count (set by the scheduler once detected), for clean mask logging */
+/* Valid TPC count (set by the scheduler once detected); only used to keep
+ * LITHOS_LOG_MASK output from listing nonexistent TPCs. */
 static int g_qmd_ntpc = 64;
-/* Thread-local arming state */
-static __thread uint64_t t_next_mask   = 0;
-static __thread uint64_t t_sticky_mask = 0;   /* applied to every upload until cleared */
-static __thread int      t_sticky      = 0;
-static __thread int      t_capture     = 0;
-static __thread uint64_t t_captured    = 0;
-static __thread int      t_atomize     = 0;
-static __thread uint64_t t_prelude     = 0;
-static __thread int      t_prelude_regs = 0;
-static __thread int      t_dump        = 0;
-static __thread uint8_t  t_captured_qmd[256];
 
-/* QMD byte offset of the per-thread register-count allocation (Ampere/Ada
- * QMDV03_00). Discovered empirically: register count is at byte 81. */
-#define QMD_REG_COUNT_OFF 81
+/* ---- Per-thread arming state ----------------------------------------------
+ * The callback runs on the launching thread, so all "what should the next launch
+ * do" state is thread-local:
+ *   t_next_mask    one-shot SM-disable mask, consumed by the next upload
+ *   t_sticky_mask  mask applied to EVERY upload until cleared (used when one
+ *                  subgraph launch contains several kernel nodes)
+ *   t_sticky       whether t_sticky_mask is armed
+ *   t_capture      arm capture of the next QMD (reverse-engineering probes)
+ *   t_captured     the captured program address
+ *   t_captured_qmd a raw copy of the captured QMD bytes
+ *   t_atomize      legacy: redirect the program address to t_prelude
+ *   t_prelude      legacy: Prelude entry VA to redirect to
+ *   t_prelude_regs legacy: register count the Prelude needs
+ *   t_dump         dump QMD bytes to stderr (probing) */
+static __thread uint64_t t_next_mask    = 0;
+static __thread uint64_t t_sticky_mask  = 0;
+static __thread int      t_sticky       = 0;
+static __thread int      t_capture      = 0;
+static __thread uint64_t t_captured     = 0;
+static __thread int      t_atomize      = 0;
+static __thread uint64_t t_prelude      = 0;
+static __thread int      t_prelude_regs = 0;
+static __thread int      t_dump         = 0;
+static __thread uint8_t  t_captured_qmd[256];
 
 static int setup_done = 0;
 
+/* Called by the driver immediately before it uploads a QMD to the hardware queue.
+ * `in_params` is an opaque parameter block whose 5th pointer slot is the QMD. */
 static void control_callback(void* ukwn, int domain, int cbid, const void* in_params) {
     (void)ukwn; (void)domain; (void)cbid;
-    if (*(uint32_t*)in_params < 5 * sizeof(void*))
-        return;
-    void* tmd = *((void**)in_params + 4);
+    /* First word is the block's size; make sure the QMD slot is actually present. */
+    if (*(uint32_t*)in_params < CB_PARAMS_MIN_SLOTS * sizeof(void*)) return;
+    void* tmd = *((void**)in_params + CB_PARAMS_QMD_SLOT);
     if (!tmd) return;
-    if (getenv("LITHOS_LOG_CB")) {   /* count EVERY pre-upload callback (any mask or not) */
+
+    if (getenv("LITHOS_LOG_CB")) {   /* count EVERY callback, mask armed or not */
         static int cbn = 0;
         fprintf(stderr, "[cb] pre-upload callback #%d (tmd=%p)\n", ++cbn, tmd);
     }
 
-    uint8_t tmd_ver = *(uint8_t*)((char*)tmd + 72);
+    /* Pick the mask field locations for this QMD version. lower/upper point at the
+     * 64-bit SM-disable mask; on Hopper we must also fill the extended words and
+     * set the enable bit, or the mask is ignored. */
+    uint8_t tmd_ver = *(uint8_t*)((char*)tmd + QMD_VERSION_OFF);
     uint32_t *lower_ptr = NULL, *upper_ptr = NULL, *ext_lo = NULL, *ext_hi = NULL;
-    if (tmd_ver >= 0x40) {              /* Hopper */
-        lower_ptr = (uint32_t*)((char*)tmd + 304);
-        upper_ptr = (uint32_t*)((char*)tmd + 308);
-        ext_lo    = (uint32_t*)((char*)tmd + 312);
-        ext_hi    = (uint32_t*)((char*)tmd + 316);
+    if (tmd_ver >= QMD_VER_HOPPER) {              /* Hopper (untested here) */
+        lower_ptr = (uint32_t*)((char*)tmd + QMD_H_MASK_LO_OFF);
+        upper_ptr = (uint32_t*)((char*)tmd + QMD_H_MASK_HI_OFF);
+        ext_lo    = (uint32_t*)((char*)tmd + QMD_H_EXT_LO_OFF);
+        ext_hi    = (uint32_t*)((char*)tmd + QMD_H_EXT_HI_OFF);
         *ext_lo = -1; *ext_hi = -1;
-        *(uint32_t*)tmd |= 0x80000000;
-    } else if (tmd_ver >= 0x16) {       /* Kepler2 .. Ampere/Ada */
-        lower_ptr = (uint32_t*)((char*)tmd + 84);
-        upper_ptr = (uint32_t*)((char*)tmd + 88);
+        *(uint32_t*)tmd |= QMD_H_ENABLE_BIT;
+    } else if (tmd_ver >= 0x16) {                 /* Kepler2 .. Ampere/Ada */
+        lower_ptr = (uint32_t*)((char*)tmd + QMD_MASK_LO_OFF);
+        upper_ptr = (uint32_t*)((char*)tmd + QMD_MASK_HI_OFF);
     }
 
     /* --- TPC mask (scheduler / stealing / graph subgraphs) ---

@@ -61,8 +61,13 @@ functionally identical, no control transfer.
 │               Driver API, forwards the rest; two entry paths (PLT + the      │
 │               runtime's cuGetProcAddress resolver)                           │
 │                                                                              │
-│ sched.c       TPC Scheduler: per-stream launch queues, compute quotas →      │
-│               TPC masks, TPC stealing, outstanding-work tracking             │
+│ sched.c            the submit path: quota mask → predict → right-size →      │
+│                    throttle → atomize; sync/batch boundaries                 │
+│ sched_stream.c     per-stream launch queues, quotas, TPC detection           │
+│ tpc_alloc.c        quotas → SM-disable masks, TPC stealing, per-atom/        │
+│                    per-subgraph slice masks, hardware right-sizing           │
+│ dispatch.c         optional dispatcher thread owning submission              │
+│ predict.c          online latency prediction + the Tracker thread            │
 │                                                                              │
 │ atomizer.c    Kernel Atomizer: module-load splice, per-launch atom split,    │
 │ atomize_splice.c   the ELF/SASS surgery that injects the range-check         │
@@ -135,7 +140,7 @@ LibLithOS forwards goes through `g_real`.
 duration, min-blocks-to-atomize, enable flags, quota, stealing, verbosity. Paper
 defaults (atom duration 250–500 µs, 100 µs outstanding limit) are the defaults.
 
-### `sched.c` (275 LOC) — TPC Scheduler (§5.3)
+### `sched.c` + `sched_stream.c` + `tpc_alloc.c` + `dispatch.c` — TPC Scheduler (§5.2/5.3/5.5)
 
 Per-stream `StreamState` (quota, assigned TPC range, launch/atom counters, idle
 timer, outstanding count). Key pieces:

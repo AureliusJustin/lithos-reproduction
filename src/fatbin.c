@@ -3,14 +3,15 @@
  * cuModuleLoadData accepts three image kinds; the splicer needs a raw ELF cubin:
  *   - raw ELF cubin (\x7fELF)      -> used directly
  *   - fatbin (magic 0xBA55ED50)    -> find the ELF entry matching the running SM,
- *                                     LZ4-decompress it if flagged, use that cubin
+ *                                     decompress it if flagged, use that cubin
  *   - PTX (text) / PTX-only fatbin -> JIT to a cubin with the driver linker
  * In every case we hand back a bare cubin; the driver loads a raw cubin fine, so
  * no fatbin *repackaging* is needed -- we just load the (spliced) inner cubin.
  *
- * NVIDIA's fatbin compression is plain LZ4 block format (the payload begins with
- * an LZ4 token, not the frame magic), with the uncompressed size carried in the
- * entry header -- so a small block decoder recovers the cubin exactly.
+ * Compression: NVIDIA used plain LZ4 *block* format through CUDA 12 (the payload
+ * begins with an LZ4 token, not the frame magic) and switched to Zstandard in
+ * CUDA 13. Both carry the uncompressed size in the entry header, so we can decode
+ * straight into a correctly-sized buffer. See the layout notes below.
  */
 #define _GNU_SOURCE
 #include <cuda.h>
@@ -25,27 +26,80 @@
  * { int magic=0x466243b1; int version; const void* data; const void* filename; }
  * whose `data` (offset 8) points at the real fatbin (0xBA55ED50). */
 #define FATBIN_WRAPPER_MAGIC 0x466243b1u
+#define FATBIN_WRAPPER_DATA_OFF 8      /* byte offset of `data` in the wrapper */
 
-/* Minimal LZ4 block decompressor. Decodes src[0..srcSize) into dst until dstCap
- * bytes are produced (the uncompressed size, known from the fatbin header) or the
- * input is exhausted. Returns bytes written, or -1 on an out-of-bounds access. */
+/* ---- fatbin layout (reverse-engineered; all little-endian) ----------------
+ *
+ * Container header:
+ *   +0x00 u32  magic      = FATBIN_MAGIC
+ *   +0x04 u16  version
+ *   +0x06 u16  header_size          (entries start here)
+ *   +0x08 u64  fat_size             (total size of all entries)
+ *
+ * Then a sequence of entries, each: [entry header][payload], where the header is
+ * `entry_header_size` bytes and the payload `stored_size` bytes, so the next entry
+ * is at (entry + entry_header_size + stored_size). Entry header fields we use:
+ */
+#define FE_KIND        0x00   /* u16: 1 = PTX, 2 = ELF cubin                     */
+#define FE_HEADER_SIZE 0x04   /* u32: size of THIS entry header (>= 0x40)        */
+#define FE_STORED_SIZE 0x08   /* u64: bytes of payload on disk (may be padded)   */
+#define FE_COMP_SIZE   0x10   /* u64: exact compressed byte count (zstd needs it)*/
+#define FE_ARCH        0x1c   /* u32: SM arch, e.g. 86                           */
+#define FE_FLAGS       0x28   /* u64: bit 0x2000 = LZ4, bit 0x8000 = zstd        */
+#define FE_UNCOMP_SIZE 0x38   /* u64: uncompressed payload size                  */
+#define FE_MIN_HEADER  0x40   /* smallest entry header we know how to parse      */
+
+#define FE_KIND_PTX 1
+#define FE_KIND_ELF 2
+
+#define FE_FLAG_LZ4  0x2000   /* CUDA <= 12 */
+#define FE_FLAG_ZSTD 0x8000   /* CUDA 13+   */
+
+/* Minimal LZ4 *block* decompressor (NVIDIA stores raw blocks, not LZ4 frames, so
+ * there is no frame magic/header to skip and no checksum to verify).
+ *
+ * LZ4 block format: a sequence of "sequences", each
+ *   [token:1] [extra literal length…] [literals…] [match offset:2] [extra match length…]
+ * where token's high nibble = literal length and low nibble = match length, each
+ * extended by trailing 255-chained bytes when the nibble is 15. A match copies
+ * `matchlen` bytes from `offset` bytes EARLIER in the output (so it can overlap,
+ * which is how runs are encoded — hence the byte-by-byte copy below).
+ *
+ *   src/srcSize : compressed input      s = read cursor
+ *   dst/dstCap  : output buffer         d = write cursor (dstCap = uncompressed
+ *                                           size, known from the entry header)
+ * Returns bytes written, or -1 if any length/offset would read or write out of
+ * bounds (i.e. the input isn't the LZ4 we expect). */
 static int lz4_block_decompress(const uint8_t* src, int srcSize, uint8_t* dst, int dstCap) {
     int s = 0, d = 0;
     while (s < srcSize && d < dstCap) {
         int token = src[s++];
+
+        /* --- literals: copy `litlen` bytes straight through --- */
         int litlen = token >> 4;
-        if (litlen == 15) { int b; do { if (s >= srcSize) return -1; b = src[s++]; litlen += b; } while (b == 255); }
+        if (litlen == 15) {                 /* 15 means "add the following bytes" */
+            int b;
+            do { if (s >= srcSize) return -1; b = src[s++]; litlen += b; } while (b == 255);
+        }
         if (s + litlen > srcSize || d + litlen > dstCap) return -1;
-        memcpy(dst + d, src + s, litlen); s += litlen; d += litlen;
-        if (d >= dstCap || s >= srcSize) break;         /* final literal run */
+        memcpy(dst + d, src + s, litlen);
+        s += litlen; d += litlen;
+        if (d >= dstCap || s >= srcSize) break;   /* last sequence is literals-only */
+
+        /* --- match: copy `matchlen` bytes from `offset` back in the OUTPUT --- */
         if (s + 2 > srcSize) return -1;
-        int offset = src[s] | (src[s + 1] << 8); s += 2;
+        int offset = src[s] | (src[s + 1] << 8); s += 2;   /* little-endian back-reference */
         int matchlen = token & 0xf;
-        if (matchlen == 15) { int b; do { if (s >= srcSize) return -1; b = src[s++]; matchlen += b; } while (b == 255); }
-        matchlen += 4;                                  /* LZ4 minimum match */
-        int mpos = d - offset;
+        if (matchlen == 15) {
+            int b;
+            do { if (s >= srcSize) return -1; b = src[s++]; matchlen += b; } while (b == 255);
+        }
+        matchlen += 4;                       /* LZ4 minimum match length is 4 */
+        int mpos = d - offset;               /* source position within dst */
         if (offset <= 0 || mpos < 0 || d + matchlen > dstCap) return -1;
-        for (int i = 0; i < matchlen; i++) dst[d + i] = dst[mpos + i];  /* may overlap */
+        /* byte-by-byte on purpose: source and destination ranges may overlap when
+         * offset < matchlen (that's how LZ4 encodes repeated runs). */
+        for (int i = 0; i < matchlen; i++) dst[d + i] = dst[mpos + i];
         d += matchlen;
     }
     return d;
@@ -84,29 +138,31 @@ static int fatbin_extract_elf(const unsigned char* fb, int want_sm,
     const unsigned char* best_elf = NULL; size_t best_elf_stored = 0, best_elf_csize = 0;
     int best_elf_comp = 0, best_elf_usz = 0, best_sm = -1;
     const unsigned char* ptx_pl = NULL; size_t ptx_stored = 0, ptx_csize = 0; int ptx_comp = 0, ptx_usz = 0;
-    while (off + 0x40 <= endp) {
+    while (off + FE_MIN_HEADER <= endp) {
         uint16_t kind;   uint32_t ehsz;
         uint64_t stored, csize, flags, usize;
         uint32_t arch;
-        memcpy(&kind, fb + off + 0x00, 2);
-        memcpy(&ehsz, fb + off + 0x04, 4);
-        memcpy(&stored, fb + off + 0x08, 8);
-        memcpy(&csize, fb + off + 0x10, 8);
-        memcpy(&arch, fb + off + 0x1c, 4);
-        memcpy(&flags, fb + off + 0x28, 8);
-        memcpy(&usize, fb + off + 0x38, 8);
-        if (ehsz < 0x40 || off + ehsz + stored > endp) break;
+        memcpy(&kind,   fb + off + FE_KIND,        2);
+        memcpy(&ehsz,   fb + off + FE_HEADER_SIZE, 4);
+        memcpy(&stored, fb + off + FE_STORED_SIZE, 8);
+        memcpy(&csize,  fb + off + FE_COMP_SIZE,   8);
+        memcpy(&arch,   fb + off + FE_ARCH,        4);
+        memcpy(&flags,  fb + off + FE_FLAGS,       8);
+        memcpy(&usize,  fb + off + FE_UNCOMP_SIZE, 8);
+        /* Unknown/blackwell-style entries use a bigger header; bail rather than
+         * mis-parse. Also guard against a truncated/lying size. */
+        if (ehsz < FE_MIN_HEADER || off + ehsz + stored > endp) break;
         const unsigned char* payload = fb + off + ehsz;
-        /* Compression type: LZ4 (CUDA <=12, flag 0x2000) or zstd (CUDA 13+, 0x8000). */
-        int comp = (flags & 0x8000) ? FAT_COMP_ZSTD : ((flags & 0x2000) ? FAT_COMP_LZ4 : FAT_COMP_NONE);
+        int comp = (flags & FE_FLAG_ZSTD) ? FAT_COMP_ZSTD
+                 : ((flags & FE_FLAG_LZ4) ? FAT_COMP_LZ4 : FAT_COMP_NONE);
 
-        if (kind == 2) {   /* ELF cubin: prefer exact SM, else highest <= want */
+        if (kind == FE_KIND_ELF) {   /* prefer exact SM match, else highest <= want */
             int sm = (int)arch;
             if (sm == want_sm || (sm <= want_sm && sm > best_sm)) {
                 best_elf = payload; best_elf_stored = stored; best_elf_csize = csize;
                 best_elf_comp = comp; best_elf_usz = (int)(comp ? usize : stored); best_sm = sm;
             }
-        } else if (kind == 1 && !ptx_pl) {  /* remember first PTX entry for JIT fallback */
+        } else if (kind == FE_KIND_PTX && !ptx_pl) {  /* first PTX entry: JIT fallback */
             ptx_pl = payload; ptx_stored = stored; ptx_csize = csize; ptx_comp = comp;
             ptx_usz = (int)(comp ? usize : stored);
         }
@@ -162,14 +218,14 @@ int atomize_image_to_cubin(const void* image, int want_sm, void** out, size_t* o
     uint32_t m; memcpy(&m, b, 4);
 
     if (getenv("LITHOS_DIAG")) {
-        const void* real = (m == FATBIN_WRAPPER_MAGIC) ? *(const void* const*)(b + 8) : image;
+        const void* real = (m == FATBIN_WRAPPER_MAGIC) ? *(const void* const*)(b + FATBIN_WRAPPER_DATA_OFF) : image;
         uint32_t rm; memcpy(&rm, real, 4);
         fprintf(stderr, "[diag] image magic=%08x (real=%08x %s)\n", m, rm,
                 rm == FATBIN_MAGIC ? "fatbin" : (memcmp(real, "\177ELF", 4) == 0 ? "elf" : "other"));
     }
 
     if (m == FATBIN_WRAPPER_MAGIC) {                  /* runtime wrapper -> real fatbin */
-        const void* real = *(const void* const*)(b + 8);
+        const void* real = *(const void* const*)(b + FATBIN_WRAPPER_DATA_OFF);
         if (real) return atomize_image_to_cubin(real, want_sm, out, outsz);
         return -1;
     }

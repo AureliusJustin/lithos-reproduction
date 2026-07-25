@@ -46,6 +46,7 @@ static void cfg_init_once(void) {
     g_lithos_cfg.latency_slip          = envd("LITHOS_SLIP", 1.1);
     g_lithos_cfg.throttle              = envi("LITHOS_THROTTLE", 0);
     g_lithos_cfg.dispatch              = envi("LITHOS_DISPATCH", 0);
+    g_lithos_cfg.perstream_quota       = envi("LITHOS_PERSTREAM_QUOTA", 0);
     /* The transparent Prelude redirect is proven, but the Prelude->original
      * tail-transfer needs a compiler-emitted JUMP (see docs); gated off so the
      * library stays correct by default. */
