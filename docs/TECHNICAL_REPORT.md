@@ -4,13 +4,15 @@ A from-scratch reproduction of the core mechanisms of **LithOS** (SOSP), a GPU
 operating system that interposes at the CUDA Driver API to (a) schedule ML
 workloads at the granularity of individual TPCs and (b) transparently split
 kernels into thread-block "atoms." The original prototype is ~5000 lines of Rust;
-this reproduction is ~2,000 lines of C/C++/CUDA, reusing the QMD/TPC-masking
+this reproduction is ~4,300 lines of C/C++/CUDA, reusing the QMD/TPC-masking
 reverse-engineering from [`../libsmctrl`](../../libsmctrl) (Bakita) and building
 directly with the system `nvcc`.
 
-**Verified hardware/software:** NVIDIA RTX A6000 (GA102, `sm_86`, QMD version
-`QMDV03_00`/`0x30`), CUDA 12.8, driver 570.195.03, Ubuntu (kernel 6.8), on a
-bare-metal host.
+**Verified hardware/software:** NVIDIA **A100 80GB PCIe** (GA100, `sm_80`, 54 TPCs,
+QMD `QMDV02_04`/`0x24`, driver 610.43.02) and **RTX A6000** (GA102, `sm_86`,
+42 TPCs, QMD `QMDV03_00`/`0x30`, drivers 570.195.03 / 595.71.05). CUDA 12.8,
+Ubuntu (kernel 6.8), bare metal. Performance figures quoted here are the A100
+numbers in [BENCHMARKS.md](BENCHMARKS.md).
 
 ---
 
@@ -104,7 +106,7 @@ differ.
 
 ## 3. Module reference
 
-### `interpose.c` (353 LOC) — the interposition surface
+### `interpose.c` (488 LOC) — the interposition surface
 
 Defines LithOS's version of each overridden Driver-API function and forwards the
 rest. Overridden calls fall into four groups:
@@ -159,7 +161,7 @@ timer, outstanding count). Key pieces:
 Verified: `LITHOS_QUOTA=4` confines a kernel to 8 SMs (4 TPCs × 2 SMs/TPC),
 `LITHOS_QUOTA=8` → 16 SMs, on both driver-API and runtime (framework) launches.
 
-### `qmd.c` (146 LOC) — the QMD pre-upload hook
+### `qmd.c` (239 LOC) — the QMD pre-upload hook
 
 The scheduler needs to modify a launch's TPC mask *below* the launch API (so it
 works no matter how the app launches). It uses the same mechanism as libsmctrl:
@@ -179,7 +181,7 @@ works no matter how the app launches). It uses the same mechanism as libsmctrl:
   atomizer does **not** use these — it only uses `qmd_set_next_mask` — but they
   remain for the scheduler and the reverse-engineering record.
 
-### `atomizer.c` (443 LOC) — Kernel Atomizer orchestration
+### `atomizer.c` (680 LOC) — Kernel Atomizer orchestration
 
 The brain of the atomizer. Responsibilities:
 
@@ -192,18 +194,30 @@ The brain of the atomizer. Responsibilities:
   return the spliced cubin plus the set of successfully-spliced kernel *names*.
 * **Function gating** (`atomizer_note_get_function` / `_get_kernel` /
   `_kernel_function` / `_library_module`): as the app resolves functions from an
-  atomized container, classify each: **gated** (name was spliced → will be split)
-  or **full-range** (from an atomized module but not in the spliced set → forced
-  full-range so it can't read a stale range). Everything else is verbatim.
-* **Dispatch** (`atomizer_dispatch`, `_ex`, `_coop`): decide the atom count, then
-  for each atom write `[lo,hi]` to `g_meta` and relaunch the full grid; the range
-  check skips out-of-range blocks. Cross-stream serialization and per-launch
-  metadata via `cuMemsetD32Async` (§5) keep it correct under concurrency and CUDA
-  graph capture.
+  atomized container, classify each into one of three classes — **ATOM** (name was
+  spliced → may be split), **FULL** (from an atomized module but *not* in the
+  spliced set → forced to an explicit full range, since it may still carry a
+  prologue and would otherwise inherit the previous atom's `[lo,hi)` and silently
+  drop blocks), or **VERBATIM** (untouched). Membership is an open-addressed
+  pointer hash set, so the per-launch lookup is O(1) even at TensorRT scale
+  (11 k+ kernels).
+* **Atom sizing** (`effective_atom_us`, `decide_atoms`): `n = predicted_duration /
+  atom_duration`, where the prediction comes from `predict.c` and the atom
+  duration is **bounded on both sides** — a floor of `atom_cost/max_overhead` so
+  splitting can never cost more than a set fraction of the kernel, and an optional
+  `LITHOS_SLO_US` ceiling tying atom size to a co-located tenant's latency budget
+  (BENCHMARKS §4).
+* **Dispatch** (`atomizer_dispatch`, `_ex`, `_coop`): for each atom, publish
+  `[lo,hi)` to `g_meta` and relaunch the full grid; the spliced range check skips
+  out-of-range blocks, and `lithos_apply_atom_mask` re-arms the (one-shot) TPC mask
+  so each atom can land on its own TPC set. Correctness under concurrency and graph
+  capture comes from `cuMemsetD32Async` metadata writes (§5) plus cross-stream
+  event serialization — the latter skipped while only one stream issues atomized
+  work, which **fails safe**: a second stream latches the fast path off permanently.
 * **Coverage stats** (`LITHOS_STATS` / `LITHOS_STATS_FILE`): counts split /
   single-atom / full-range / un-atomized launches and distinct kernels.
 
-### `atomize_splice.c` (197 LOC) — the SASS/ELF surgery
+### `atomize_splice.c` (549 LOC) — the SASS/ELF surgery
 
 The mechanical core. Two entry points:
 
@@ -212,15 +226,35 @@ The mechanical core. Two entry points:
   range-check SASS up to a `0xDEADBEEF` marker, pads it to a 128-byte multiple
   with `NOP`s, and records its register requirement. `b` is the global block
   index from `blockIdx`/`gridDim`; `meta` is read from a literal absolute address.
-* `atomize_splice_cubin(cubin, prologue)`: for each `.text.<fn>` section, inserts
-  the prologue bytes at the front and fixes up **section headers, program headers
-  (the driver loads via these), the function symbol size, the `.nv.info`
-  register count, and every instruction-offset attribute** (`EXIT_INSTR_OFFSETS`
-  and the special `INDIRECT_BRANCH_TARGETS`). Kernels that can't be spliced (e.g.
-  with `.text` relocations) are skipped and stay runnable verbatim; only the
-  spliced names are returned for gating.
+* `atomize_splice_cubin(cubin, prologue)`: inserts the prologue at the front of
+  every **kernel-entry** `.text.<fn>` section and repairs everything that encodes
+  an offset into the shifted code.
 
-### `fatbin.c` (170 LOC) — image unwrapping
+  It is a **single pass**: plan all insertions, do one segmented copy into a
+  correctly-sized buffer, then fix the headers once. The reason this is possible
+  is that only *file* offsets accumulate across insertions (section headers,
+  program headers — the driver loads via those — and `e_shoff`/`e_phoff`); symbol
+  `st_value`, `.nv.info` instruction offsets and relocation `r_offset`s are
+  **section-relative**, so each kernel shifts by just its own prologue length. A
+  naive one-kernel-at-a-time splice re-copies the whole cubin each time and is
+  O(n²) — 92 ms for 600 kernels versus 0.25 ms now (see BENCHMARKS §2, §7).
+
+  What gets repaired: section + program headers, the function symbol's size, the
+  `.nv.info` register count, every instruction-offset attribute
+  (`EXIT_INSTR_OFFSETS`, `CTAID_OFFSETS`, and the structured
+  `INDIRECT_BRANCH_TARGETS`), and — for separately compiled `-rdc=true` kernels —
+  **ELF relocations**: every `r_offset` is bumped, a self-referential `RELA` addend
+  (e.g. the return address the compiler materialises for a device-function `CALL`)
+  is bumped, and local-label `st_value`s move with the code.
+
+  Only **kernel entries** are spliced, identified by the `STO_CUDA_ENTRY` bit
+  (`st_other & 0x10`): a `__device__` function also gets its own `.text.<fn>`, but
+  it is *called*, so an `EXIT`-prologue would kill the thread instead of returning.
+  The residual unfixable cases — a self-referential `REL`, whose addend lives
+  inside the instruction bytes, and malformed/undersized stub cubins — are skipped
+  and stay runnable verbatim; only the spliced names are returned for gating.
+
+### `fatbin.c` (253 LOC) — image unwrapping
 
 `atomize_image_to_cubin(image, want_sm)` turns any module image into a raw cubin:
 
@@ -236,6 +270,46 @@ The mechanical core. Two entry points:
 In every case the driver is later handed a bare (spliced) cubin — no fatbin
 repackaging is needed, since `cuLibraryLoadData`/`cuModuleLoadData` accept a raw
 cubin.
+
+### `predict.c` (333 LOC) — online latency prediction + the Tracker thread (§5.7)
+
+Learns each operator's execution time online, with no offline profiling. An
+**operator** is identified the way the paper describes: by its **ordinal `k`** on a
+launch queue — the k-th kernel since that queue's last sync — because the same
+kernel function recurs with different tensor shapes, so the function alone is not a
+useful key. `predict_reset_op` restarts the ordinal at every sync (a batch
+boundary).
+
+Measurement uses **one CUDA event per launch**, recorded *after* it as a completion
+marker; a kernel's duration is the gap to the previous completion on the same queue
+(a stream runs its launches serially). A **Tracker thread** reaps those events,
+updates an EMA per operator, and maintains the in-flight-µs counter the
+outstanding-work throttle reads. Per-task tracking is deliberately not sampled: the
+same Tracker signal clears the sync queues and updates the stealing timers, not just
+the predictor.
+
+`predict_rightsize` additionally fits the §5.5 curve `l = m/t + b` from two probed
+samples (all-TPC and 1-TPC) and returns the fewest TPCs within a latency-slip bound.
+
+Because CUDA calls from another thread can invalidate an in-progress graph capture,
+the Tracker is fenced: `predict_capture_begin` waits for it to leave its CUDA
+section, and the Tracker refuses to enter one while a capture is open.
+
+### `graphsched.c` (246 LOC) — CUDA-graph subgraph scheduling
+
+Implements the paper's "atomize graphs into subgraphs, ensuring correct execution
+ordering" (`LITHOS_GRAPH_SUBGRAPHS=K`). At `cuGraphInstantiate` the graph is
+partitioned along a **topological cut** of its dependency DAG (Kahn sort over
+`cuGraphGetNodes`/`GetEdges`; each subgraph built with `cuGraphClone` plus
+`cuGraphDestroyNode` for the nodes outside its chunk). At `cuGraphLaunch` the app's
+single launch is fanned into K sequential subgraph launches on the same stream — so
+stream order preserves every cross-cut dependency — each preceded by that
+subgraph's TPC allocation applied as a **sticky** mask, since one subgraph may hold
+several kernel nodes.
+
+The subgraph **templates** are retained, so when a subgraph's desired allocation
+changes it is **re-instantiated** from its template (the only way to re-bake an SM
+mask — see §7) while unchanged subgraphs simply replay.
 
 ### `wrapper.c` (33 LOC) — libcuda.so.1 wrapper glue
 
@@ -254,8 +328,9 @@ paper / libsmctrl). The Makefile also patches the wrapper's `DT_NEEDED` from
 ```
 app: cuLibraryLoadData(code)  ─▶ interpose.c
    atomizer_intercept_cubin(code)
-     ├─ fatbin.c: unwrap __fatBinC_Wrapper_t → fatbin → LZ4-decode → raw cubin
-     └─ atomize_splice.c: prepend range-check into every .text.<fn>, fix ELF
+     ├─ fatbin.c: unwrap __fatBinC_Wrapper_t → fatbin → LZ4/Zstd-decode → raw cubin
+     └─ atomize_splice.c: single pass — prepend range-check into every kernel-entry
+        .text.<fn>, then fix headers/symbols/.nv.info/relocations once
    g_real.cuLibraryLoadData(spliced_cubin)  → CUlibrary
    register (CUlibrary → set of spliced kernel names)
 ```
@@ -277,16 +352,22 @@ safely (full range).
 
 ```
 app: cuLaunchKernel[Ex](f, grid, ...)  ─▶ interpose.c ─▶ lithos_submit_launch[_ex]
-   presubmit: quota → TPC disable mask → qmd_set_next_mask   (scheduler)
+   sched_stream.c : find/create this stream's launch queue          (Fig.9 (1))
+   tpc_alloc.c    : quota (+ stealing) → disable mask → qmd_set_next_mask  (2)
+   predict.c      : operator = ordinal k on this queue; pred_us = lookup   (5.7)
+   tpc_alloc.c    : optional right-sizing may narrow the mask             (6)
+   sched.c        : optional outstanding-work throttle                    (5)
    atomizer_dispatch[_ex]:
-     if f is ATOMIZABLE:
-        n = decide_atoms(grid)                # ceil(pred_us / atom_duration)
-        lock; wait(g_atom_ev)                 # cross-stream serialization
+     if f is ATOM:
+        n = decide_atoms(grid, pred_us)       # bounded by overhead floor + SLO cap
+        lock; [wait(g_atom_ev) unless single-stream or capturing]
         for each atom [lo,hi):
-           cuMemsetD32Async(g_meta+0, lo); cuMemsetD32Async(g_meta+4, hi)
+           write {lo,hi} to g_meta            # 2x cuMemsetD32Async, elided if unchanged
+           lithos_apply_atom_mask(...)        # one-shot mask: per-atom TPC set
            relaunch full grid                 # range check skips out-of-range blocks
-        record(g_atom_ev); unlock
-     elif f is FULL-RANGE: serialized write {0, grid}; relaunch once
+        [record(g_atom_ev)]; unlock
+     elif f is FULL: write {0, grid}; relaunch once
+   predict.c      : record one completion event for the Tracker          (5.7)
      else: forward verbatim
 ```
 
@@ -406,7 +487,7 @@ re-instantiate → the callback fires again. Two modes follow:
    replay-stable (ranges bake into the memset immediates), but the schedule is
    **frozen**: atom ranges are baked, and per-atom TPC masks don't apply (the
    one-shot mask can't map onto N nodes). It's also **expensive on graphs** — even
-   at n=1 it adds two metadata `memset` nodes per kernel (+120 % replay; see
+   at n=1 it adds two metadata `memset` nodes per kernel (+114 % replay; see
    [BENCHMARKS](BENCHMARKS.md)).
 2. **Partition-into-subgraphs (`LITHOS_GRAPH_SUBGRAPHS=K`,
    [`src/graphsched.c`](../src/graphsched.c)) — the paper's model.** Kernels are
@@ -457,7 +538,8 @@ cooperative/cluster launches, and the multi-stream safeguards of §5.5.
 
 ## 7. Reverse-engineering findings
 
-* **QMD/TMD layout** (Ampere/Ada `QMDV03_00`, this A6000): TMD version at byte 72;
+* **QMD/TMD layout** (Ampere/Ada `QMDV03_00`, measured on the A6000; the A100's
+  `QMDV02_04` uses the same mask offsets): TMD version at byte 72;
   SM-disable mask at bytes **84/88**; live program address (64-bit) at byte
   **192** (its `>>8` mirror at byte 32); register-count allocation at byte **81**
   (min 16). Grid dims at bytes 48/52/56. Perturbing byte 192 faults; perturbing
@@ -497,11 +579,30 @@ cooperative/cluster launches, and the multi-stream safeguards of §5.5.
 | `test_atomize_runtime` | the CUDA-runtime-API launch path (frameworks use this) |
 | `test_atomize_graph` | CUDA-graph capture → atomized subgraph → correct replay |
 | `test_scheduler` | `LITHOS_QUOTA=4` confines a kernel to 8 SMs |
+| `test_stealing` × 2 | **TPC stealing** (§5.3): with disjoint per-stream quotas, an idle stream's TPCs are lent to a busy one (8 → 16 SMs); run both with stealing off and on |
+| `test_tpc_timers` × 2 | **per-TPC timers** (§5.3): a stream that submitted a long kernel and went quiet must not have its TPCs stolen. Run twice — with timers on (must refuse the steal) and off (the control: the idle-only heuristic must still take it, or the test no longer discriminates) |
+| `test_dispatch_order` | **dispatcher ordering** (§5.2): no memcpy, event, or query can overtake a launch still sitting in a launch queue |
+| `test_dispatch_mt` | **dispatcher submission**: every worker actually submits the launches it takes. Ordering alone cannot see a worker that silently drops its work, so this counts them. Must be a CUDA-*runtime* app launching on the **default stream** — an explicit stream still succeeds without a current context (the driver infers it from the stream handle), which hides the failure |
+| `test_coord.sh` | **system-wide coordinator** (§5.1): cross-application quotas give disjoint ranges, an idle tenant's TPCs are borrowed, a higher-priority tenant is never robbed, and two tenants joining *simultaneously* still never share a range (repeated 6×, since the creation race is intermittent) |
+| `correctness_matrix` | 7 kernel patterns (elementwise, tiled matmul with shared memory, atomics, 3-D grid, transpose) checked against a CPU reference under forced max-split — the atomic kernels are the exactly-once guards |
+
+Beyond the unit suite, `bash bench/fw_all.sh` validates real libraries end-to-end
+(4 targets × 8 configurations). It is the harness that caught all three bugs in
+[FINDINGS §5](FINDINGS.md) — each of which passed the table above.
 
 ### Frameworks — correctness **and** atomization coverage
 
 Coverage measured with `LITHOS_STATS_FILE` (per-launch split / single-atom /
 full-range / **un-atomized** counts).
+
+> **Provenance:** these are *coverage and correctness* results, measured on the
+> RTX A6000 with the framework versions listed (drivers 570.195.03 / 595.71.05).
+> They are not performance numbers and are unaffected by later optimization.
+> TensorFlow, JAX, TensorRT and vLLM remain A6000-only — they are not installed on
+> the A100 node. PyTorch (2.13.0+cu126) and Triton (3.7.1) **have** been re-run
+> there, along with cuBLAS and cuFFT, across 8 configurations each:
+> [BENCHMARKS §7](BENCHMARKS.md).
+
 
 | framework | result | coverage (0 un-atomized = all kernels atomized) |
 |-----------|--------|--------------------------------------------------|
@@ -528,7 +629,7 @@ Every kernel of every framework is atomized; all load kernels through
   `LITHOS_QMD_PROG_OFF`. **Cross-driver validation — done:** the same A6000 was
   upgraded in-place from **570.195.03 → 595.71.05** (a CUDA-13-era driver, five
   branches newer) and *every* LithOS component still worked unchanged — full test
-  suite 8/8, scheduler quota still confines to 4 TPCs (so the QMD mask offsets and
+  suite green, scheduler quota still confines to 4 TPCs (so the QMD mask offsets and
   the callback-table indices held), PyTorch 100% atomization coverage. So the
   reverse-engineering is robust across a large driver jump on the same GPU. A
   **second run on a fresh A6000** repeated the 570→595 upgrade *and* installed the

@@ -15,6 +15,7 @@
 #include "real.h"
 #include "atomizer.h"
 #include "qmd.h"
+#include "coord.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,7 +33,12 @@ int             g_tpc_base = 0;         /* LITHOS_TPC_BASE: this process's first
                                          * MPS this lets separate processes occupy
                                          * disjoint TPCs. */
 
-static int      g_phys_sms = 0;         /* true physical SM count (spoof math)  */
+/* Scheduling priority given to streams the application did not prioritise
+ * itself (LITHOS_PRIO). Lower = more important, matching CUDA's convention, so a
+ * stream created with cuStreamCreateWithPriority keeps the value the app chose
+ * and needs no translation. */
+static int      g_default_prio = 0;
+
 
 /* ---- device topology ------------------------------------------------------ */
 
@@ -53,9 +59,19 @@ void detect_tpcs(void) {
 
     int sms_per_tpc = (major >= 6) ? 2 : 1;      /* Pascal and later: 2 SMs per TPC */
     g_num_tpcs = sms > 0 ? (uint32_t)(sms / sms_per_tpc) : 0;
-    g_phys_sms = sms;
     qmd_set_num_tpcs((int)g_num_tpcs);           /* for clean mask logging */
     SLOG("detected %d SMs -> %u TPCs", sms, g_num_tpcs);
+
+    /* Now that the device is known, register with the system-wide tenant table
+     * (§5.1). It hands back a range disjoint from every other live tenant, so
+     * cross-application quotas need no hand-assigned LITHOS_TPC_BASE. */
+    if (coord_join((int)g_num_tpcs, g_default_quota, g_lithos_cfg.priority)) {
+        int lo, hi;
+        if (coord_my_range(&lo, &hi) && g_default_quota > 0) {
+            g_tpc_base = lo;
+            SLOG("coordinator assigned TPC range [%d,%d) (%d tenants)", lo, hi, coord_tenant_count());
+        }
+    }
 }
 
 void lithos_sched_init(void) {
@@ -65,6 +81,8 @@ void lithos_sched_init(void) {
     if (q) g_default_quota = atoi(q);
     const char* base = getenv("LITHOS_TPC_BASE");
     if (base) g_tpc_base = atoi(base);
+    const char* prio = getenv("LITHOS_PRIO");
+    if (prio) g_default_prio = atoi(prio);
     /* TPC count is detected lazily (see detect_tpcs). */
 }
 
@@ -103,13 +121,18 @@ int        g_ranges_disjoint = 0;   /* read by compute_disable_mask_ex */
  *                             meaningful: an idle stream now owns TPCs that a busy
  *                             one can borrow. Caller holds g_lock. */
 static void assign_tpc_range(StreamState* st) {
+    st->priority   = g_default_prio;
     st->quota_tpcs = g_default_quota;
     if (g_default_quota <= 0) return;
 
+    /* A stream is usually created BEFORE the first launch, so the device may not
+     * have been probed yet — and probing is also what registers this process with
+     * the system-wide tenant table and yields our assigned TPC range (§5.1).
+     * Without this the stream would be pinned to the default base before the
+     * coordinator ever spoke, and every tenant would land on the same TPCs. */
+    if (g_num_tpcs == 0) detect_tpcs();
+
     if (g_lithos_cfg.perstream_quota) {
-        /* A stream can be created before the first launch, so the TPC count may not
-         * have been probed yet — do it now (a context exists by cuStreamCreate). */
-        if (g_num_tpcs == 0) detect_tpcs();
         int span = (g_num_tpcs > 0) ? (int)g_num_tpcs - g_tpc_base : g_default_quota;
         if (span < g_default_quota) span = g_default_quota;
         int slot = (g_quota_streams * g_default_quota) % span;
@@ -155,11 +178,23 @@ void lithos_stream_created(CUstream s, int priority) {
         memset(&g_streams[i], 0, sizeof(StreamState));
         g_streams[i].in_use   = 1;
         g_streams[i].s        = s;
-        g_streams[i].priority = priority;
         assign_tpc_range(&g_streams[i]);
+        g_streams[i].priority = priority;   /* the app's own value wins over LITHOS_PRIO */
         break;
     }
     pthread_mutex_unlock(&g_lock);
+}
+
+/* Priority of a stream's launch queue, for the dispatcher's choice of what to
+ * send next (§5.2). Streams we have not seen yet are not created here — a launch
+ * on an unregistered stream is about to register it anyway — so they simply
+ * report the process default. */
+int lithos_stream_prio(CUstream s) {
+    pthread_mutex_lock(&g_lock);
+    StreamState* st = find_stream(s);
+    int p = st ? st->priority : g_default_prio;
+    pthread_mutex_unlock(&g_lock);
+    return p;
 }
 
 void lithos_stream_destroyed(CUstream s) {

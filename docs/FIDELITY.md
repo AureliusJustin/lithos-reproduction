@@ -14,14 +14,15 @@ Legend: ✅ faithful · ≈ divergent (same goal, different mechanism) · ◑ si
 
 | Area | Paper | This reproduction | |
 |------|-------|-------------------|--|
-| Language / size | ~5000 lines **Rust**, macro-generated interposition of the **entire** Driver API | ~2000 lines **C/C++/CUDA**, hand-picked subset | ≈ |
+| Language / size | ~5000 lines **Rust**, macro-generated interposition of the **entire** Driver API | ~4300 lines **C/C++/CUDA**, hand-picked subset of the API | ≈ |
 | Interposition point | CUDA Driver API, no cross-address-space marshaling | same (in-process, driver API) | ✅ |
 | API coverage | auto-generates the whole Driver API; implements a small subset | overrides ~two dozen calls by hand; forwards the rest via `cuGetProcAddress` | ◑ |
 | Deployment | native + **containers** | `LD_PRELOAD` or `libcuda.so.1` wrapper; containers untested | ◑ |
-| TPC masking (QMD) | reverse-engineered; Ampere, **Hopper**, Ada; extends libsmctrl | reverse-engineered; **Ampere only** tested (Hopper offsets present, untested) | ◑ |
+| TPC masking (QMD) | reverse-engineered; Ampere, **Hopper**, Ada; extends libsmctrl | reverse-engineered; verified on **GA102 (A6000, 42 TPCs)** and **GA100 (A100, 54 TPCs)**. Hopper offsets present but untested — and the scheduler's mask is **64-bit**, so on H100 (66 TPCs) TPCs 64+ could not be masked without widening it | ◑ |
 | Compute quotas | guaranteed TPCs per tenant | `LITHOS_QUOTA` → QMD mask, verified | ✅ |
-| TPC stealing | idle **applications** lend TPCs to busy ones | implemented + tested (`tests/test_stealing.c`), but **intra-process only**: it can lend between *streams*, not tenants. Needs `LITHOS_PERSTREAM_QUOTA=1` to give streams disjoint ranges — with the paper's one-quota-per-application model every stream shares a range and lending is a provable no-op | ◑ |
-| Launch queues / dispatcher | per-stream queues + dispatcher/tracker threads (Fig. 9) | per-stream launch queues; a **Tracker thread** reaps completions; a **Dispatcher thread** submits launches (`LITHOS_DISPATCH`, opt-in — a hand-off, since a transparent interposer can't safely snapshot `cuLaunchKernel`'s implicit-size args) | ◑→✅ |
+| TPC stealing | idle **applications** lend TPCs to busy ones | **cross-application**, via the coordinator: an idle tenant's TPCs are borrowed by a busy one (**1.99× throughput**, 311 → 620 it/s), and a *higher-priority* tenant is never robbed even while idle (§5.3). Also works intra-process between streams with `LITHOS_PERSTREAM_QUOTA=1`. Tested by `tests/test_coord.sh` + `tests/test_stealing.c` | ✅ |
+| Per-TPC timers | "maintains **per-TPC timers** informed by a latency prediction module, estimating kernel (and atom) durations at submission time… these timers help **avoid stealing from long-running TPCs**" (§5.3) | **implemented** (`LITHOS_TPC_TIMERS`, on by default). At submission each launch publishes `now + predicted_us` against every TPC it will occupy, into the coordinator's shared array so the timers are visible **across applications**; a steal skips any TPC whose timer has not expired. Never applied to a tenant's own quota — that is a guarantee. Tested both directions by `tests/test_tpc_timers.c` | ✅ |
+| Launch queues / dispatcher | per-stream queues + dispatcher/tracker threads (Fig. 9); "LithOS enqueues the kernel and **returns control to the application**" (§5.2) | per-stream launch queues; a **Tracker thread** reaps completions; **Dispatcher threads** submit launches. True **fire-and-forget**: `cuFuncGetParamInfo` snapshots the arguments, so the app thread enqueues and returns without waiting for submission. Opt-in (`LITHOS_DISPATCH`) rather than the paper's always-on default: the hand-off costs ~25 µs/launch, which is free by ≈1 ms kernels but **−25 % throughput at ≈0.12 ms** ([BENCHMARKS §1](BENCHMARKS.md)) | ✅ |
 | Outstanding-work throttle | 100 µs sync-queue throttle, event reaping | **enforced** (`LITHOS_THROTTLE`): defers dispatch until event-reaped in-flight µs < limit | ✅ |
 | Duration predictor | a predictor (§5.7) | **online event-measured, operator-indexed** (ordinal k per launch queue, reset on sync), EMA-refined, TPC-scaled | ✅ |
 | Hardware right-sizing | yes | **occupancy filtering heuristic + `l=m/t+b` scaling model + latency-slip `k`** (`LITHOS_RIGHTSIZE`, `LITHOS_SLIP`) | ✅ |
@@ -29,12 +30,12 @@ Legend: ✅ faithful · ≈ divergent (same goal, different mechanism) · ◑ si
 | **Atomizer control transfer** | QMD **program-address → Prelude**, Prelude **jumps** into the original (Rust/LLVM tail call) | **splice the range-check into each kernel's own `.text`** so in-range blocks **fall through**; no Prelude, no jump, no QMD redirect | ≈ |
 | When atomization is applied | at launch (patch the live QMD) | at **module load** (ELF surgery on the cubin) | ≈ |
 | Per-atom metadata delivery | Prelude gets an `AtomMetadata` struct; **mechanism not specified** | shared device buffer written per launch (`cuMemsetD32Async`) + event serialization | ? |
-| Atom sizing | target duration 250–500 µs | `LITHOS_ATOM_US`, fed by the **online predictor** (falls back to the stub only until an operator is learned) | ✅ |
+| Atom sizing | `atom_duration` is a hand-tuned constant ("250–500 µs are effective"); the paper only *warns* that too small a value can make the kernel slower | `LITHOS_ATOM_US` fed by the **online predictor**, then **bounded on both sides**: a floor of `atom_cost/max_overhead` *guarantees* splitting can't cost more than a set fraction of the kernel (turning the paper's caveat into an invariant), and an optional `LITHOS_SLO_US` ceiling ties atom size to a co-located tenant's latency budget — which is what actually determines HoL blocking | ✅+ |
 | CUDA Graphs | "interpose graph creation APIs and atomize graphs into subgraphs, ensuring correct execution ordering" | **both** interpretations: (a) atomize kernels into an in-graph subgraph (default, correct but schedule frozen); (b) `LITHOS_GRAPH_SUBGRAPHS=K` partitions the graph into K subgraphs along a topological cut, each independently TPC-allocated (the paper's likely intent) | ✅≈ |
 | Graph replay rescheduling | (unspecified) | TPC mask **cannot** change on replay — QMD pre-upload callback fires once/exec; reallocation needs re-instantiation (subgraph granularity makes it cheap) | ? |
 | Hopper Thread Block Clusters | atoms are multiples of cluster size | cluster launches detected and **not split** (no cluster-multiple sizing) | ◑ |
 | Special (cross-block-sync/persistent) kernels | disable stealing+atomization; report allocated SM count via `cuDeviceGetAttribute` | cooperative/cluster launches **not split** and given their **exact quota (no stealing/right-sizing)**; **`cuDeviceGetAttribute(MULTIPROCESSOR_COUNT)` spoofed** to `quota×2` SMs; non-cooperative persistent kernels still undetectable | ✅≈ |
-| Multi-tenant coordination | central scheduler assigns resources across tenants | **per-process**; `LITHOS_TPC_BASE` gives manual disjoint ranges (no central coordinator) | ◑ |
+| Multi-tenant coordination | "maintains a **system-wide view of GPU state across applications** with varying priorities" (§5.1, Fig. 8) | **implemented** (`src/coord.c`): a POSIX shm tenant table every LibLithOS maps. Cross-application quotas (disjoint ranges assigned automatically, no `LITHOS_TPC_BASE`), cross-application TPC stealing, and the priority safeguard. Tested by `tests/test_coord.sh` | ✅ |
 | MPS | "we build on top of MPS" | auto-starts MPS; concurrency + partitioning verified | ✅ |
 
 ---
@@ -86,7 +87,8 @@ program-address redirect. It is functionally the same per-block gate (Algorithm
   but **does not say how it's delivered per launch**. We use a shared device
   buffer + `cuMemsetD32Async` + cross-stream event serialization. This is *our*
   design; we cannot claim it matches the original, and it is the source of the
-  ~4 µs/launch atomizer overhead measured in [BENCHMARKS.md](BENCHMARKS.md).
+  atomizer overhead measured in [BENCHMARKS.md](BENCHMARKS.md) (now ~0.3 µs/launch
+  after removing three redundant driver calls; it was ~5 µs before that).
 
 ---
 
@@ -156,9 +158,12 @@ The scheduler beyond quotas/stealing — previously stubbed — is now reproduce
   curve; it does not model input-size features beyond the ordinal, and probing
   advances on async reaps (a few iterations of warm-up). The stub `blocks × 0.5 µs`
   remains only as the cold-start fallback before an operator is first measured.
-- **Dispatcher decoupling.** The dispatcher is a correct hand-off, not a
-  fire-and-forget async enqueue (see above) — the app thread still blocks until
-  submission, so there's no CPU-launch-latency win, only the central-scheduling role.
+- **Per-TPC timer benefit is unquantified.** The timers below are verified to make
+  the *decision* the paper specifies, but no microbenchmark here shows a latency
+  win from the steal they refuse: a trivial borrower co-schedules into the free
+  warp slots of a partially-occupied SM rather than queueing behind it. Showing
+  the head-of-line blocking of Figure 10(b) needs a borrower whose blocks actually
+  exhaust those SMs, which is not reproduced.
 - **API coverage.** We override only the calls the mechanisms need and forward
   the rest; we do not macro-generate the entire Driver API.
 - **Hopper.** `qmd.c` carries the Hopper (TMD ≥ 0x40) mask offsets but they are
@@ -169,10 +174,22 @@ The scheduler beyond quotas/stealing — previously stubbed — is now reproduce
 ## Not implemented
 
 - **Power management.**
-- **Central multi-tenant scheduler.** Our scheduler is per-process; disjoint TPC
-  ranges across tenants are assigned manually via `LITHOS_TPC_BASE` rather than by
-  a coordinator. Cross-process quota arbitration, fairness, and preemption
-  policies are out of scope.
+- **Lower hardware stream priority for stolen work (§5.3).** The paper mitigates
+  priority inversion on borrowed TPCs two ways: it "limits outstanding atoms"
+  (we do — the outstanding-work throttle) *and* "uses lower hardware stream
+  priorities for work on stolen TPCs" (we do not). Ours submits stolen-TPC work on
+  the stream the application asked for, at that stream's own priority. Doing it the
+  paper's way means submitting on a different, lower-priority stream than the app
+  named, which changes that stream's ordering guarantees — safe only if the
+  dispatcher also inserts the events to restore them. Our priority safeguard is
+  therefore admission-side only: a higher-priority tenant is never robbed
+  (`tests/test_coord.sh`), but once TPCs *are* lent, the borrower's work competes at
+  full hardware priority.
+- **Cross-process fairness and preemption policies.** The system-wide coordinator
+  *is* implemented (§5.1, `src/coord.c` — cross-application quotas, stealing, and
+  the priority safeguard, see the summary table). What is out of scope is the
+  richer policy layer above it: quota arbitration under contention, fair-share, and
+  preemption.
 - **Non-cooperative persistent-kernel detection.** We detect cross-block-sync via
   the cooperative/cluster launch attributes; a persistent kernel that grid-syncs
   without those attributes is still undetectable transparently.

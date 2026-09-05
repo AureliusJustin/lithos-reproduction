@@ -5,7 +5,7 @@ CXX    ?= g++
 ARCH   ?= native          # auto-detect the installed GPU (A6000=sm_86, A100=sm_80, ...)
 
 CFLAGS  := -Wall -Wno-parentheses -fPIC -O2 -g -Isrc -I$(CUDA)/include
-LDFLAGS := -ldl -lpthread -L$(CUDA)/lib64 -lcuda -l:libzstd.so.1
+LDFLAGS := -ldl -lpthread -lrt -L$(CUDA)/lib64 -lcuda -l:libzstd.so.1
 
 BUILD := build
 
@@ -20,10 +20,10 @@ all: $(BUILD)/liblithos_full.so $(BUILD)/libcuda.so.1 tests
 #  The Prelude is JIT-compiled at runtime via NVRTC (address baked in), so no
 #  prelude.o is linked; prelude.cu is retained as documentation.
 # ----------------------------------------------------------------------
-FULL_SRC := src/interpose.c src/real.c src/config.c \
+FULL_SRC := src/interpose.c src/real.c src/config.c src/barrier.c src/params.c \
             src/sched.c src/sched_stream.c src/tpc_alloc.c src/dispatch.c \
             src/atomizer.c src/atomize_splice.c src/fatbin.c src/qmd.c \
-            src/graphsched.c src/predict.c
+            src/graphsched.c src/predict.c src/coord.c
 
 # liblithos_full.so: LD_PRELOAD in front of a driver-API app.
 $(BUILD)/liblithos_full.so: $(FULL_SRC) src/*.h | $(BUILD)
@@ -44,7 +44,9 @@ tests: $(BUILD)/test_interpose $(BUILD)/test_interpose_driver \
        $(BUILD)/test_atomize_runtime $(BUILD)/test_atomize_graph \
        $(BUILD)/atomize_mark.cubin $(BUILD)/atomize_mark.fatbin \
        $(BUILD)/atomize_mark.ptx $(BUILD)/test_scheduler \
-       $(BUILD)/correctness_matrix $(BUILD)/test_stealing $(BUILD)/steal_probe.cubin
+       $(BUILD)/correctness_matrix $(BUILD)/test_stealing $(BUILD)/steal_probe.cubin \
+       $(BUILD)/test_dispatch_order $(BUILD)/test_dispatch_mt $(BUILD)/order_probe.cubin \
+       $(BUILD)/test_tpc_timers
 
 # CUDA-runtime apps (exercise the libcuda.so.1 wrapper path used by frameworks)
 $(BUILD)/test_interpose: tests/test_interpose.cu | $(BUILD)
@@ -78,8 +80,44 @@ $(BUILD)/test_stealing: tests/test_stealing.c | $(BUILD)
 	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
 $(BUILD)/steal_probe.cubin: tests/steal_probe.cu | $(BUILD)
 	$(NVCC) -arch=$(ARCH) -cubin $< -o $@
+# Per-TPC timers (5.3): stealing must skip a TPC whose work is still running,
+# which the idle-only heuristic cannot see.
+$(BUILD)/test_tpc_timers: tests/test_tpc_timers.c | $(BUILD)
+	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
 $(BUILD)/test_scheduler: tests/test_scheduler.c | $(BUILD)
 	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
+# Ordering regression for buffered launches (Sec 5.2): proves no memcpy/event/
+# query can overtake a launch still sitting in a LithOS launch queue.
+$(BUILD)/test_dispatch_order: tests/test_dispatch_order.c | $(BUILD)
+	$(CC) -O2 $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
+$(BUILD)/order_probe.cubin: tests/order_probe.cu | $(BUILD)
+	$(NVCC) -arch=$(ARCH) -cubin $< -o $@
+# Multi-worker regression: proves every dispatcher worker actually SUBMITS the
+# launches it takes, which the ordering test above cannot see.
+$(BUILD)/test_dispatch_mt: tests/test_dispatch_mt.cu | $(BUILD)
+	$(NVCC) -arch=$(ARCH) -O2 $< -o $@ -lcudart
+
+# ----------------------------------------------------------------------
+#  Benchmarks (docs/BENCHMARKS.md). Built on demand: `make bench`
+# ----------------------------------------------------------------------
+BENCH_BINS := $(BUILD)/launchbench $(BUILD)/modload $(BUILD)/graphprof \
+              $(BUILD)/scalebench $(BUILD)/heavybench $(BUILD)/hpbench \
+              $(BUILD)/beload $(BUILD)/tenant $(BUILD)/batchbench $(BUILD)/stealbench \
+              $(BUILD)/dispatchbench $(BUILD)/idler
+BENCH_CUBINS := $(BUILD)/kernels/work.cubin $(BUILD)/kernels/probe_smid.cubin \
+                $(BUILD)/kernels/detk.cubin $(BUILD)/kernels/mm.cubin \
+                $(BUILD)/kernels/nullk.cubin
+
+.SECONDARY: $(BENCH_BINS) $(BENCH_CUBINS)   # pattern-rule outputs are not intermediates
+.PHONY: bench
+bench: $(BENCH_BINS) $(BENCH_CUBINS)
+
+$(BUILD)/kernels:
+	mkdir -p $(BUILD)/kernels
+$(BUILD)/kernels/%.cubin: bench/kernels/%.cu | $(BUILD)/kernels
+	$(NVCC) -arch=$(ARCH) -cubin $< -o $@
+$(BUILD)/%: bench/%.c | $(BUILD)
+	$(CC) -O2 $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda -lpthread
 
 .PHONY: run_tests
 run_tests: all
@@ -102,6 +140,16 @@ run_tests: all
 	@echo "== TPC Stealing: idle stream's TPCs lent to a busy one (5.3) =="
 	STEAL_CUBIN=$(BUILD)/steal_probe.cubin LITHOS_QUOTA=4 LITHOS_PERSTREAM_QUOTA=1 LITHOS_STEALING=0 LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_stealing
 	STEAL_CUBIN=$(BUILD)/steal_probe.cubin LITHOS_QUOTA=4 LITHOS_PERSTREAM_QUOTA=1 LITHOS_STEALING=1 LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_stealing
+	@echo "== Per-TPC timers: never steal a TPC whose work is still running (5.3) =="
+	STEAL_CUBIN=$(BUILD)/steal_probe.cubin LITHOS_QUOTA=4 LITHOS_PERSTREAM_QUOTA=1 LITHOS_STEALING=1 LITHOS_TPC_TIMERS=0 LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_tpc_timers
+	STEAL_CUBIN=$(BUILD)/steal_probe.cubin LITHOS_QUOTA=4 LITHOS_PERSTREAM_QUOTA=1 LITHOS_STEALING=1 LITHOS_TPC_TIMERS=1 LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_tpc_timers
+	@echo "== Dispatcher: buffered launches are never overtaken (5.2) =="
+	LITHOS_DISPATCH=1 ORDER_CUBIN=$(BUILD)/order_probe.cubin LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_dispatch_order
+	@echo "== Dispatcher: every worker submits the launches it takes (5.2) =="
+	LITHOS_DISPATCH=1 LITHOS_DISPATCH_THREADS=4 LD_LIBRARY_PATH=$(BUILD) $(BUILD)/test_dispatch_mt
+	@echo "== System-wide coordinator: cross-app quotas, stealing, priority (5.1) =="
+	$(MAKE) -s $(BUILD)/idler $(BUILD)/tenant $(BUILD)/kernels/work.cubin
+	bash tests/test_coord.sh
 	@echo "== Correctness matrix -- varied kernels vs CPU reference, forced max-split =="
 	LITHOS_ATOM_US=1 LITHOS_STATS=1 LD_LIBRARY_PATH=$(BUILD) $(BUILD)/correctness_matrix
 

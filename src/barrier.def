@@ -1,0 +1,116 @@
+/*
+ * barrier.def — the driver calls that must not overtake a buffered launch.
+ *
+ * §5.2 has LithOS "enqueue the kernel and return control to the application".
+ * The moment it does, the launch exists only in a LithOS launch queue: the
+ * driver has never heard of it, and the stream it belongs to looks empty. Any
+ * other stream-ordered call issued in that window would therefore be placed
+ * BEFORE the kernel that, from the application's point of view, was already
+ * issued. A `cuLaunchKernel` followed by `cuMemcpyDtoHAsync` on the same stream
+ * would copy back the memory the kernel had not written yet.
+ *
+ * So every such call drains first. This file lists them; barrier.c expands each
+ * entry into a forwarder that drains and then calls the real driver function,
+ * and interpose.c registers them so both interposition paths see them. The paper
+ * describes the same division of labour — "LithOS implements only a small subset
+ * of Driver APIs (e.g. cuLaunchKernel); our toolchain auto-generates the rest".
+ *
+ *   BARRIER_S(sym, params, args, stream)  drain `stream` (plus the legacy default
+ *                                         stream, which is ordered against all)
+ *   BARRIER_A(sym, params, args)          drain everything: calls with no stream
+ *                                         argument are legacy-stream ordered, and
+ *                                         teardown/free can race any queue at all
+ *
+ * `sym` is the exported symbol, so versioned names appear as e.g.
+ * cuMemcpyHtoD_v2; barrier.c also answers cuGetProcAddress lookups of the
+ * unversioned name.
+ *
+ * Cost when nothing is buffered — including always, when the dispatcher is off —
+ * is one relaxed atomic load (dispatch_pending), so this costs nothing to carry.
+ */
+
+/* ---- asynchronous copies ------------------------------------------------- */
+BARRIER_S(cuMemcpyAsync, (CUdeviceptr d, CUdeviceptr s, size_t n, CUstream st), (d,s,n,st), st)
+BARRIER_S(cuMemcpyHtoDAsync_v2, (CUdeviceptr d, const void* s, size_t n, CUstream st), (d,s,n,st), st)
+BARRIER_S(cuMemcpyDtoHAsync_v2, (void* d, CUdeviceptr s, size_t n, CUstream st), (d,s,n,st), st)
+BARRIER_S(cuMemcpyDtoDAsync_v2, (CUdeviceptr d, CUdeviceptr s, size_t n, CUstream st), (d,s,n,st), st)
+BARRIER_S(cuMemcpy2DAsync_v2, (const CUDA_MEMCPY2D* p, CUstream st), (p,st), st)
+BARRIER_S(cuMemcpy3DAsync_v2, (const CUDA_MEMCPY3D* p, CUstream st), (p,st), st)
+BARRIER_S(cuMemcpyPeerAsync, (CUdeviceptr dd, CUcontext dc, CUdeviceptr sd, CUcontext sc, size_t n, CUstream st), (dd,dc,sd,sc,n,st), st)
+BARRIER_S(cuMemcpy3DPeerAsync, (const CUDA_MEMCPY3D_PEER* p, CUstream st), (p,st), st)
+BARRIER_S(cuMemcpyAtoHAsync_v2, (void* d, CUarray a, size_t off, size_t n, CUstream st), (d,a,off,n,st), st)
+BARRIER_S(cuMemcpyHtoAAsync_v2, (CUarray a, size_t off, const void* s, size_t n, CUstream st), (a,off,s,n,st), st)
+
+/* ---- asynchronous fills -------------------------------------------------- */
+BARRIER_S(cuMemsetD8Async, (CUdeviceptr d, unsigned char v, size_t n, CUstream st), (d,v,n,st), st)
+BARRIER_S(cuMemsetD16Async, (CUdeviceptr d, unsigned short v, size_t n, CUstream st), (d,v,n,st), st)
+BARRIER_S(cuMemsetD32Async, (CUdeviceptr d, unsigned int v, size_t n, CUstream st), (d,v,n,st), st)
+BARRIER_S(cuMemsetD2D8Async, (CUdeviceptr d, size_t p, unsigned char v, size_t w, size_t h, CUstream st), (d,p,v,w,h,st), st)
+BARRIER_S(cuMemsetD2D16Async, (CUdeviceptr d, size_t p, unsigned short v, size_t w, size_t h, CUstream st), (d,p,v,w,h,st), st)
+BARRIER_S(cuMemsetD2D32Async, (CUdeviceptr d, size_t p, unsigned int v, size_t w, size_t h, CUstream st), (d,p,v,w,h,st), st)
+
+/* ---- stream-ordered allocation ------------------------------------------- *
+ * cuMemFreeAsync in particular: freeing memory a buffered kernel still reads
+ * would hand that allocation to someone else while the kernel is pending. */
+BARRIER_S(cuMemAllocAsync, (CUdeviceptr* p, size_t n, CUstream st), (p,n,st), st)
+BARRIER_S(cuMemFreeAsync, (CUdeviceptr p, CUstream st), (p,st), st)
+BARRIER_S(cuMemAllocFromPoolAsync, (CUdeviceptr* p, size_t n, CUmemoryPool pool, CUstream st), (p,n,pool,st), st)
+BARRIER_S(cuMemPrefetchAsync, (CUdeviceptr p, size_t n, CUdevice dev, CUstream st), (p,n,dev,st), st)
+BARRIER_S(cuStreamAttachMemAsync, (CUstream st, CUdeviceptr p, size_t n, unsigned int f), (st,p,n,f), st)
+
+/* ---- events and stream-ordered host work --------------------------------- *
+ * An event recorded ahead of a buffered launch would signal too early, and a
+ * cuStreamWaitEvent inserted ahead of one would order against the wrong point.
+ * Both are how applications express cross-stream dependencies, so getting these
+ * wrong would break exactly the programs that need ordering most. */
+BARRIER_S(cuEventRecord, (CUevent e, CUstream st), (e,st), st)
+BARRIER_S(cuEventRecordWithFlags, (CUevent e, CUstream st, unsigned int f), (e,st,f), st)
+BARRIER_S(cuStreamWaitEvent, (CUstream st, CUevent e, unsigned int f), (st,e,f), st)
+BARRIER_S(cuLaunchHostFunc, (CUstream st, CUhostFn fn, void* ud), (st,fn,ud), st)
+BARRIER_S(cuStreamAddCallback, (CUstream st, CUstreamCallback cb, void* ud, unsigned int f), (st,cb,ud,f), st)
+
+/* "Is this stream finished?" must not answer yes while its work is still in a
+ * launch queue. */
+BARRIER_S(cuStreamQuery, (CUstream st), (st), st)
+
+/* ---- blocking copies and fills ------------------------------------------- *
+ * No stream argument: these are ordered against the legacy default stream, which
+ * is ordered against every blocking stream — so they see, and must wait for,
+ * everything. */
+BARRIER_A(cuMemcpy, (CUdeviceptr d, CUdeviceptr s, size_t n), (d,s,n))
+BARRIER_A(cuMemcpyHtoD_v2, (CUdeviceptr d, const void* s, size_t n), (d,s,n))
+BARRIER_A(cuMemcpyDtoH_v2, (void* d, CUdeviceptr s, size_t n), (d,s,n))
+BARRIER_A(cuMemcpyDtoD_v2, (CUdeviceptr d, CUdeviceptr s, size_t n), (d,s,n))
+BARRIER_A(cuMemcpy2D_v2, (const CUDA_MEMCPY2D* p), (p))
+BARRIER_A(cuMemcpy2DUnaligned_v2, (const CUDA_MEMCPY2D* p), (p))
+BARRIER_A(cuMemcpy3D_v2, (const CUDA_MEMCPY3D* p), (p))
+BARRIER_A(cuMemcpyPeer, (CUdeviceptr dd, CUcontext dc, CUdeviceptr sd, CUcontext sc, size_t n), (dd,dc,sd,sc,n))
+BARRIER_A(cuMemcpy3DPeer, (const CUDA_MEMCPY3D_PEER* p), (p))
+BARRIER_A(cuMemcpyAtoH_v2, (void* d, CUarray a, size_t off, size_t n), (d,a,off,n))
+BARRIER_A(cuMemcpyHtoA_v2, (CUarray a, size_t off, const void* s, size_t n), (a,off,s,n))
+BARRIER_A(cuMemsetD8_v2, (CUdeviceptr d, unsigned char v, size_t n), (d,v,n))
+BARRIER_A(cuMemsetD16_v2, (CUdeviceptr d, unsigned short v, size_t n), (d,v,n))
+BARRIER_A(cuMemsetD32_v2, (CUdeviceptr d, unsigned int v, size_t n), (d,v,n))
+BARRIER_A(cuMemsetD2D8_v2, (CUdeviceptr d, size_t p, unsigned char v, size_t w, size_t h), (d,p,v,w,h))
+BARRIER_A(cuMemsetD2D16_v2, (CUdeviceptr d, size_t p, unsigned short v, size_t w, size_t h), (d,p,v,w,h))
+BARRIER_A(cuMemsetD2D32_v2, (CUdeviceptr d, size_t p, unsigned int v, size_t w, size_t h), (d,p,v,w,h))
+
+/* ---- waiting on, or asking about, an event ------------------------------- *
+ * The event itself was ordered correctly when it was recorded, but a buffered
+ * launch on ANY stream may still be part of what the caller means to wait for,
+ * and elapsed-time queries would otherwise measure a gap that has not happened. */
+BARRIER_A(cuEventSynchronize, (CUevent e), (e))
+BARRIER_A(cuEventQuery, (CUevent e), (e))
+BARRIER_A(cuEventElapsedTime, (float* ms, CUevent a, CUevent b), (ms,a,b))
+BARRIER_A(cuEventDestroy_v2, (CUevent e), (e))
+
+/* ---- teardown ------------------------------------------------------------ *
+ * Freeing memory, unloading the module that owns the code, or tearing down the
+ * context out from under a launch that has not been submitted yet. */
+BARRIER_A(cuMemFree_v2, (CUdeviceptr p), (p))
+BARRIER_A(cuMemFreeHost, (void* p), (p))
+BARRIER_A(cuMemHostUnregister, (void* p), (p))
+BARRIER_A(cuModuleUnload, (CUmodule m), (m))
+BARRIER_A(cuLibraryUnload, (CUlibrary l), (l))
+BARRIER_A(cuCtxDestroy_v2, (CUcontext c), (c))
+BARRIER_A(cuDevicePrimaryCtxRelease_v2, (CUdevice d), (d))

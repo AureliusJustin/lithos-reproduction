@@ -23,9 +23,17 @@
 #include "lithos_sched.h"
 #include "qmd.h"
 #include "predict.h"
+#include "coord.h"
 #include <stdio.h>
 
-/* Mask of every TPC that exists on this device (bit t set == TPC t is real). */
+/* Mask of every TPC that exists on this device (bit t set == TPC t is real).
+ *
+ * LIMIT: the mask is 64 bits, so TPCs 64 and above cannot be addressed. That
+ * covers every GPU we test on (A6000 = 42 TPCs, A100 = 54) but NOT Hopper
+ * (H100 = 66 TPCs): qmd.c already writes Hopper's two "extended" mask words as
+ * all-ones, so TPCs 64+ stay permanently ENABLED and simply cannot be masked
+ * off. Supporting them means widening this mask (and the qmd_set_*_mask API)
+ * past 64 bits. Flagged in docs/FIDELITY.md rather than silently mis-scheduling. */
 static uint64_t all_tpcs_bits(void) {
     return (g_num_tpcs >= 64) ? ~0ull : ((1ull << g_num_tpcs) - 1);
 }
@@ -46,6 +54,11 @@ uint64_t compute_disable_mask_ex(StreamState* st, uint64_t now, int allow_steal)
     uint64_t enable = 0;
     for (int t = st->tpc_lo; t < st->tpc_hi && t < 64; t++) enable |= (1ull << t);
 
+    /* Everything we might BORROW is accumulated separately from our own quota,
+     * because the per-TPC timers below may veto a borrow but must never touch the
+     * range this stream is guaranteed (§5.2: a quota is a guarantee). */
+    uint64_t steal = 0;
+
     /* Stealing can only add TPCs if some other stream owns a DIFFERENT range.
      * When every stream shares one application-wide range (the default), lending
      * is a no-op — so skip the scan rather than walk all slots on every launch. */
@@ -57,14 +70,49 @@ uint64_t compute_disable_mask_ex(StreamState* st, uint64_t now, int allow_steal)
                        (now - other->last_launch_ns > g_idle_ns) ||
                        (other->outstanding == 0);
             if (!idle) continue;
-            for (int t = other->tpc_lo; t < other->tpc_hi && t < 64; t++) enable |= (1ull << t);
+            for (int t = other->tpc_lo; t < other->tpc_hi && t < 64; t++) steal |= (1ull << t);
         }
     }
-    return (~enable) & all_tpcs_bits();      /* disable everything not enabled */
+
+    /* TPC Stealing ACROSS APPLICATIONS (§5.3): "the scheduler dynamically
+     * reassigns underutilized TPCs across applications". The coordinator reports
+     * which other tenants are idle right now and lends us their TPCs — never a
+     * higher-priority tenant's, and only until that tenant has work again. */
+    if (allow_steal && g_lithos_cfg.enable_stealing)
+        steal |= coord_stealable_tpcs(now, g_idle_ns);
+
+    /* Per-TPC timers (§5.3): "these timers help avoid stealing from long-running
+     * TPCs". The idle checks above are a binary busy/idle test, and they are blind
+     * to a TPC that was handed a multi-millisecond kernel a moment ago: its owner
+     * has outstanding work but has not launched again, so it can read as idle.
+     * Borrowing there puts our work behind that kernel — Figure 10(b)'s head-of-
+     * line blocking. The timer says how much longer each TPC is expected to be
+     * busy, so a borrow that would land behind unfinished work is dropped. */
+    if (steal && g_lithos_cfg.tpc_timers) steal &= ~coord_busy_tpcs(now);
+
+    return (~(enable | steal)) & all_tpcs_bits();  /* disable everything not enabled */
 }
 
 uint64_t compute_disable_mask(StreamState* st, uint64_t now) {
     return compute_disable_mask_ex(st, now, 1);
+}
+
+/* Which TPCs a disable-mask leaves ENABLED. The QMD wants the disable form, but
+ * the per-TPC timers are published over the TPCs a launch will actually run on,
+ * so the launch path needs to convert back. A zero disable-mask means
+ * unrestricted, i.e. every TPC on the device. */
+uint64_t tpc_enabled_of(uint64_t disable_mask) {
+    return disable_mask ? (~disable_mask) & all_tpcs_bits() : all_tpcs_bits();
+}
+
+/* Record this launch's expected completion against every TPC it will occupy
+ * (§5.3). `pred_us <= 0` means the predictor has no estimate yet — publishing a
+ * guess would either under-protect the TPC or pin it for far too long, so we
+ * publish nothing and stealing falls back to the idle checks for that launch. */
+void tpc_mark_busy(uint64_t disable_mask, double pred_us, uint64_t now_ns) {
+    if (!g_lithos_cfg.tpc_timers || pred_us <= 0) return;
+    coord_mark_tpcs_busy(tpc_enabled_of(disable_mask),
+                         now_ns + (uint64_t)(pred_us * 1000.0));
 }
 
 /* Disable-mask that enables exactly `w` TPCs starting at `base` (right-sizing). */

@@ -42,6 +42,7 @@
 #include "atomizer.h"
 #include "qmd.h"
 #include "real.h"
+#include "dispatch.h"
 
 #define AZLOG(...) do { if (g_lithos_cfg.verbose) { \
     fprintf(stderr, "[atomizer] " __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -185,12 +186,33 @@ static long g_st_split;      /* launches split into >1 atom      */
 static long g_st_atom1;      /* gated launches that stayed 1 atom */
 static long g_st_full;       /* launches forced to the full range */
 static long g_st_verbatim;   /* launches passed through untouched */
+/* Coverage below 100% on a closed-source library is only actionable if you know
+ * WHICH kernel escaped. cuFuncGetName (CUDA 12.3+) reports it whichever API handed
+ * out the handle -- including paths that never call cuModuleGetFunction -- but it
+ * needs a live context, so the name is captured here at the launch rather than in
+ * the atexit stats dump. */
+static const char* g_verb_names[MAX_FUNCS];
+static int         g_verb_names_n;
+static void note_verbatim_name(void* f) {
+    static CUresult (*get_name)(const char**, CUfunction);
+    static int tried;
+    if (!tried) { tried = 1;
+        get_name = (CUresult(*)(const char**, CUfunction))lithos_real_sym("cuFuncGetName"); }
+    const char* nm = NULL;
+    if (get_name && get_name(&nm, (CUfunction)f) == CUDA_SUCCESS && nm &&
+        g_verb_names_n < MAX_FUNCS)
+        g_verb_names[g_verb_names_n++] = nm;   /* driver-owned, lives as long as the module */
+}
+
 static void stat_verbatim(void* f) {
     __atomic_fetch_add(&g_st_verbatim, 1, __ATOMIC_RELAXED);
     pthread_mutex_lock(&g_mtx);
     if (!g_verb_set) g_verb_set = fset_alloc();
-    if (g_verb_set && !fset_has(g_verb_set, f)) { fset_add(g_verb_set, f); if (g_verb_funcs_n < MAX_FUNCS)
-        g_verb_funcs[g_verb_funcs_n++] = f; }
+    if (g_verb_set && !fset_has(g_verb_set, f)) {
+        fset_add(g_verb_set, f);
+        if (g_verb_funcs_n < MAX_FUNCS) g_verb_funcs[g_verb_funcs_n++] = f;
+        if (getenv("LITHOS_DIAG")) note_verbatim_name(f);
+    }
     pthread_mutex_unlock(&g_mtx);
     stats_tick();
 }
@@ -204,6 +226,22 @@ static void write_stats(FILE* fp) {
         g_atom_funcs_n, g_full_funcs_n, g_verb_funcs_n,
         g_st_split, g_st_atom1, g_st_full, g_st_verbatim,
         atomized, total, total ? 100.0 * atomized / total : 0.0);
+
+    for (int i = 0; i < g_verb_names_n; i++)
+        fprintf(fp, "[diag] un-atomized kernel: %s\n", g_verb_names[i]);
+
+    /* Dispatcher coverage (§5.2). Buffered vs submitted inline matters as much
+     * as atomization coverage does: a launch that fell back to inline submission
+     * was never schedulable, so it is invisible to every policy above it. */
+    if (g_lithos_cfg.dispatch) {
+        uint64_t buf = 0, inl = 0, reord = 0;
+        dispatch_stats(&buf, &inl, &reord);
+        fprintf(fp, "[stats] dispatcher: buffered=%llu inline-fallback=%llu (%.1f%% buffered) "
+                    "reordered=%llu\n",
+                (unsigned long long)buf, (unsigned long long)inl,
+                (buf + inl) ? 100.0 * (double)buf / (double)(buf + inl) : 0.0,
+                (unsigned long long)reord);
+    }
 }
 /* Periodic dump to LITHOS_STATS_FILE.<pid> so coverage survives a subprocess
  * (e.g. vLLM's EngineCore) killed rather than exited -- and so the launch-free
@@ -353,19 +391,34 @@ void atomizer_note_library_module(CUmodule m, CUlibrary lib) {
     }
     pthread_mutex_unlock(&g_mtx);
 }
+/* Why a kernel ended up in the class it did. Coverage is the headline number in
+ * docs/BENCHMARKS.md, and when a closed-source library reports 0% the question is
+ * always the same: did we never see the module, or did we see it and skip the
+ * kernel? This answers it by name. */
+static void diag_class(const char* api, const char* name, int have_container, int gated) {
+    if (!getenv("LITHOS_DIAG")) return;
+    fprintf(stderr, "[diag] %s %-48s -> %s\n", api, name ? name : "(null)",
+            !have_container ? "VERBATIM (container not spliced)"
+                            : (gated ? "gated" : "full-range (name not in splice set)"));
+}
+
 /* module -> function (cuModuleGetFunction): gate iff this kernel name was spliced. */
 void atomizer_note_get_function(CUfunction f, CUmodule m, const char* name) {
     pthread_mutex_lock(&g_mtx);
     Container* c = find_container(m);
-    if (c) { if (names_have(c->names, c->n, name)) add_atom_func(f); else add_full_func(f); }
+    int gated = 0;
+    if (c) { if ((gated = names_have(c->names, c->n, name))) add_atom_func(f); else add_full_func(f); }
     pthread_mutex_unlock(&g_mtx);
+    diag_class("cuModuleGetFunction", name, c != NULL, gated);
 }
 /* library -> kernel (cuLibraryGetKernel): a CUkernel can be launched directly. */
 void atomizer_note_get_kernel(CUkernel k, CUlibrary lib, const char* name) {
     pthread_mutex_lock(&g_mtx);
     Container* c = find_container(lib);
-    if (c) { if (names_have(c->names, c->n, name)) add_atom_func(k); else add_full_func(k); }
+    int gated = 0;
+    if (c) { if ((gated = names_have(c->names, c->n, name))) add_atom_func(k); else add_full_func(k); }
     pthread_mutex_unlock(&g_mtx);
+    diag_class("cuLibraryGetKernel", name, c != NULL, gated);
 }
 /* kernel -> function (cuKernelGetFunction): inherit the kernel handle's class. */
 void atomizer_note_kernel_function(CUfunction f, CUkernel k) {
@@ -373,6 +426,55 @@ void atomizer_note_kernel_function(CUfunction f, CUkernel k) {
     if (g_atom_set && fset_has(g_atom_set, (void*)k)) add_atom_func(f);
     else if (g_full_set && fset_has(g_full_set, (void*)k)) add_full_func(f);
     pthread_mutex_unlock(&g_mtx);
+}
+
+/* Last-resort classification, from the function handle alone.
+ *
+ * The notifiers above cover every API that hands out a kernel handle BY NAME
+ * (cuModuleGetFunction, cuLibraryGetKernel, cuKernelGetFunction). CUDA 12 also
+ * offers bulk enumeration -- cuLibraryEnumerateKernels / cuLibraryGetKernelCount,
+ * which cuFFT uses -- that returns handles with no names at all, so a library
+ * using it would launch every kernel VERBATIM even though we spliced its module.
+ * Chasing each new enumeration API is a losing game; instead ask the driver which
+ * module a handle belongs to and what it is called. If the module is one we
+ * spliced, the kernel classifies exactly as it would have on the named path.
+ *
+ * Both queries need a live context, which a launch guarantees. Called once per
+ * distinct handle (the caller memoises via g_atom_set/g_full_set/g_seen_set).
+ * Caller must NOT hold g_mtx. */
+static int classify_by_handle(CUfunction f) {
+    static CUresult (*get_mod)(CUmodule*, CUfunction);
+    static CUresult (*get_name)(const char**, CUfunction);
+    static int tried;
+    if (!tried) { tried = 1;
+        get_mod  = (CUresult(*)(CUmodule*, CUfunction))lithos_real_sym("cuFuncGetModule");
+        get_name = (CUresult(*)(const char**, CUfunction))lithos_real_sym("cuFuncGetName"); }
+    if (!get_mod || !get_name) return 0;
+
+    CUmodule m = NULL; const char* nm = NULL;
+    if (get_mod(&m, f) != CUDA_SUCCESS || !m) return 0;
+    if (get_name(&nm, f) != CUDA_SUCCESS || !nm) return 0;
+
+    int gated = 0;
+    pthread_mutex_lock(&g_mtx);
+    Container* c = find_container(m);
+    if (c) { if ((gated = names_have(c->names, c->n, nm))) add_atom_func(f); else add_full_func(f); }
+    pthread_mutex_unlock(&g_mtx);
+    if (c) diag_class("byHandle", nm, 1, gated);
+    return c != NULL;
+}
+
+/* Handles already put through classify_by_handle, so an un-spliced kernel costs
+ * the two driver queries once rather than on every launch. */
+static void** g_seen_set;
+static int   handle_classified(CUfunction f) {
+    pthread_mutex_lock(&g_mtx);
+    if (!g_seen_set) g_seen_set = fset_alloc();
+    int seen = g_seen_set && fset_has(g_seen_set, (void*)f);
+    if (!seen && g_seen_set) fset_add(g_seen_set, (void*)f);
+    pthread_mutex_unlock(&g_mtx);
+    if (seen) return 0;
+    return classify_by_handle(f);
 }
 
 static int is_atomized_func(CUfunction f) {
@@ -388,6 +490,49 @@ static int is_full_func(CUfunction f) {
  * available; otherwise we fall back to the `blocks x 0.5us` stub. For very large
  * grids the atom_duration is scaled up to bound early-exit thread-block traffic
  * (the paper's aggressiveness control). */
+/* Choose the atom duration for this launch.
+ *
+ * The paper treats atom_duration as a hand-tuned constant ("limits of 250-500us
+ * are effective") and only WARNS that "if this parameter is set too low, an
+ * atomized kernel may actually take longer to complete" — leaving it to the
+ * operator to avoid that. Both bounds can be derived instead of guessed:
+ *
+ *  FLOOR — from the overhead we actually pay. Every atom is a full-grid relaunch
+ *     whose out-of-range blocks reach the prologue and exit, so splitting into n
+ *     atoms costs about n x atom_cost_us. Requiring that cost to stay under a
+ *     fraction f of the kernel's own runtime gives atom_us >= atom_cost_us / f.
+ *     This turns the paper's caveat into a guarantee: splitting can never add more
+ *     than f of the kernel's duration, whatever the operator configured.
+ *
+ *  CEILING — from the latency budget. A co-located latency-critical tenant waits
+ *     behind at most ONE atom of this kernel (measured: HP tail latency tracked
+ *     atom size almost exactly, see docs/BENCHMARKS.md §4), so if this process
+ *     must not delay others by more than LITHOS_SLO_US, atoms must not exceed it.
+ *     The paper has no equivalent: its fixed 250-500us is unrelated to any SLO.
+ *
+ * Plus the paper's own aggressiveness control: very large grids get a longer atom
+ * duration, to bound the extra thread-block traffic from early-exiting blocks. */
+static double effective_atom_us(uint64_t blocks) {
+    double atom_us = g_lithos_cfg.atom_duration_us;
+
+    /* Paper: "for kernels with a large number of thread blocks, the Kernel
+     * Atomizer dynamically adjusts the atom_duration parameter." */
+    if (blocks > 4096) atom_us *= 2.0;
+
+    /* FLOOR: keep splitting overhead under max_overhead of the kernel's runtime. */
+    double frac = g_lithos_cfg.atom_max_overhead;
+    if (frac > 0.0 && g_lithos_cfg.atom_cost_us > 0.0) {
+        double floor_us = g_lithos_cfg.atom_cost_us / frac;
+        if (atom_us < floor_us) atom_us = floor_us;
+    }
+
+    /* CEILING: never make another tenant wait longer than its budget. */
+    if (g_lithos_cfg.slo_us > 0.0 && atom_us > g_lithos_cfg.slo_us)
+        atom_us = g_lithos_cfg.slo_us;
+
+    return atom_us > 1.0 ? atom_us : 1.0;
+}
+
 static int decide_atoms(uint64_t blocks, double pred_us) {
     if (!g_lithos_cfg.enable_atomizer) return 1;
     if (g_lithos_cfg.graph_subgraphs > 1) return 1;  /* graphs: subgraph is the unit, kernels run whole */
@@ -396,8 +541,8 @@ static int decide_atoms(uint64_t blocks, double pred_us) {
         return (uint64_t)n > blocks ? (int)blocks : n;
     }
     if (blocks < (uint64_t)g_lithos_cfg.min_blocks_to_atomize) return 1;
-    double atom_us = g_lithos_cfg.atom_duration_us;
-    if (blocks > 4096) atom_us *= 2.0;
+
+    double atom_us = effective_atom_us(blocks);
     double dur = (pred_us > 0) ? pred_us : (double)blocks * 0.5;   /* predictor, or stub */
     int n = (int)(dur / atom_us);
     if (n < 1) n = 1;
@@ -510,6 +655,10 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
     CUstream   s      = (CUstream)k->stream;
 
     /* --- classes VERBATIM and FULL (see the gating comment near the top) --- */
+    /* Unknown handle: it may still come from a module we spliced but have been
+     * obtained through a bulk-enumeration API that carries no name (see
+     * classify_by_handle). Ask the driver once before giving up on it. */
+    if (!is_atomized_func(f) && !is_full_func(f)) handle_classified(f);
     if (!is_atomized_func(f)) {
         if (!is_full_func(f)) {                 /* VERBATIM: not ours, pass through */
             stat_verbatim(f);

@@ -35,10 +35,15 @@ int    predict_rightsize(int slot, int op, int all_tpcs, double slip, int* want_
  * the duration as the gap from the previous completion on the same queue, and
  * updates the table. One event per launch, not a start/stop pair — see predict.c. */
 CUevent predict_evt_get(void);
-void    predict_submit(int slot, int op, int tpcs, CUevent done_evt);
+/* `start_evt` may be NULL: pass one only when this launch has no in-batch
+ * predecessor (the first kernel after a sync), so it can still be timed. */
+void    predict_submit(int slot, int op, int tpcs, CUevent start_evt, CUevent done_evt);
 
 /* Outstanding work (§5.3): us of in-flight (submitted-not-yet-reaped) work. */
 double  predict_outstanding_us(void);
+/* Number of launches submitted but not yet reaped. The throttle needs this so it
+ * can always keep at least one launch in flight (see throttle_wait). */
+int     predict_outstanding_n(void);
 
 /* Start the Tracker thread (reaps completions, feeds the table, decrements
  * outstanding). Idempotent. */

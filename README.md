@@ -13,8 +13,17 @@ The original prototype is ~5000 lines of Rust. This reproduction is written in
 ```
 make            # builds build/liblithos_full.so, build/libcuda.so.1, tests
 make run_tests  # runs the full suite: interposition (both paths), atomizer
-                # (cubin/fatbin/PTX/runtime/graph), scheduler, correctness matrix
+                # (cubin/fatbin/PTX/runtime/graph), scheduler, dispatcher,
+                # coordinator, correctness matrix
+
+bash bench/fw_all.sh   # end-to-end on real libraries: cuBLAS, cuFFT, PyTorch,
+                       # Triton -- each x 8 LithOS configs, checking correctness
+                       # AND atomization coverage
 ```
+
+`run_tests` and `fw_all.sh` catch different things, so run both. Every bug in
+[FINDINGS §5](docs/FINDINGS.md) passed the unit suite and was caught only by real
+libraries — the failure mode is a system that looks healthy while doing nothing.
 
 ## Usage — putting LithOS in front of your workload
 
@@ -54,7 +63,9 @@ All behaviour is controlled through environment variables — see
 [Configuration](#configuration-environment-variables) for the full list.
 
 > 📄 **Full technical report:** [docs/TECHNICAL_REPORT.md](docs/TECHNICAL_REPORT.md) — every module, how they work together, the reverse-engineering findings, and the framework validation.
-> 📊 **Benchmarks:** [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — (1) launch-latency overhead (interposition ~0.35 µs, atomizer ~4 µs, predictor ~5 µs); (2) **CUDA-graph overhead** (atomize-in-graph +120 %+ vs subgraph single-digit %, ~8 µs/subgraph reallocation); (3) **scheduler-mechanism overhead** (§5.2–5.7); (4) **reproducing the paper's performance experiments** — spatial isolation (HP p99 within 2 % of ideal vs 2.8× under MPS), MPS 3× work conservation, atomization 16× HoL reduction, right-sizing R²≈1.
+> 📊 **Benchmarks:** [docs/BENCHMARKS.md](docs/BENCHMARKS.md) — per-component overhead, CUDA-graph costs, the paper's experiments reproduced, **full A100 results** (isolation restores 99 % of solo throughput vs 29 % under plain MPS; atomization cuts HP tail latency **23×**; right-sizing R²=1.0000), and a **use-case study** of when LithOS is worth enabling.
+> 🧪 **Findings:** [docs/FINDINGS.md](docs/FINDINGS.md) — what the experiments established: **when LithOS is worth enabling** (the interfering kernel's duration decides it), what each mechanism is worth, which paper results reproduce, and the non-obvious things we had to discover (graphs freeze the TPC allocation; atom size *is* the tail latency).
+> 🔬 **Benchmark harnesses:** [bench/README.md](bench/README.md) — `make bench`, then the exact command for every number in the docs.
 > 🔍 **Fidelity vs. the paper:** [docs/FIDELITY.md](docs/FIDELITY.md) — what's faithful, what diverges (the atomizer transfer), what's simplified/stubbed, what's not implemented, and what the paper leaves unspecified.
 
 ## Hardware requirements
@@ -68,10 +79,11 @@ running GPU's SASS), so the same build runs on either. Verified on:
 | **RTX A6000** (GA102) | `sm_86` | `QMDV03_00` (`0x30`) | ✅ | ✅ | ✅ end-to-end (prologue splice) |
 | **A100 80GB** (GA100) | `sm_80` | `QMDV02_04` (`0x24`) | ✅ | ✅ | ✅ arch-agnostic splice (prologue JIT'd to `sm_80`) |
 
-CUDA 12.8; **validated across drivers 570.195.03 and 595.71.05** (upgraded
-in-place, five branches newer — every component still worked, incl. the QMD-mask
-scheduler and 100% framework atomization coverage, confirming the reverse-
-engineering is driver-version-robust). The atomizer works by splicing a range-check into
+CUDA 12.8; **validated across drivers 570.195.03, 595.71.05 and 610.43.02** —
+the last on an **A100 (GA100, 54 TPCs)**, i.e. the paper's own GPU, where the full
+suite (interposition, atomizer via cubin/fatbin/PTX/runtime/graph, quotas, TPC
+stealing, correctness matrix) passes unchanged. Spanning three driver branches and
+two Ampere dies confirms the reverse-engineering is version- and die-robust. The atomizer works by splicing a range-check into
 each kernel's own SASS (below) — an **arch-agnostic** technique that needs no
 QMD program-address redirect, so it does not depend on the per-arch QMD layout
 differences. *Nothing in this project benefits from a datacenter GPU* — an earlier
@@ -108,6 +120,7 @@ arches fault).
 | `src/sched_stream.c` | the stream registry = per-stream **launch queues** (Fig. 9 ①): quotas, TPC ranges, idle/outstanding bookkeeping, TPC detection |
 | `src/tpc_alloc.c` | turning a quota into an SM-disable mask: **compute quotas** (②), **TPC stealing**, per-atom/per-subgraph slice masks, **right-sizing** (⑥) |
 | `src/dispatch.c` | the optional **dispatcher thread** (§5.2) that owns submission (`LITHOS_DISPATCH`) |
+| `src/coord.c` | the **system-wide coordinator** (§5.1, Fig. 8): a shared-memory tenant table every LibLithOS maps — cross-application quotas, cross-application TPC stealing, priority safeguards |
 | `src/predict.c` | **online latency prediction** (§5.7) + the **Tracker thread** that reaps completion events |
 | `src/graphsched.c` | CUDA-graph **subgraph partitioning** + per-subgraph TPC allocation with runtime re-instantiation |
 | `src/qmd.c` | QMD/TMD pre-upload hook (libsmctrl-style debug callback): TPC mask (scheduler), program-address capture/patch, register-count bump |
@@ -159,17 +172,18 @@ MPS**, exactly as the paper states — without MPS, separate processes **time-sl
 the GPU, so masking one tenant to a few TPCs just idles the rest. The wrapper sets
 `CUDA_DEVICE_MAX_CONNECTIONS=8` for MPS, and `LITHOS_TPC_BASE` lets each process
 take a disjoint TPC range (the job a central LithOS scheduler does for tenants).
-Measured, two concurrent processes each with `LITHOS_QUOTA=8` and disjoint bases
-(`0` and `8`) running the same compute-bound kernel:
+Measured on the A100 with two co-located tenants (aggregate throughput):
 
-| | per-process time | total wall |
-|---|---|---|
-| **without MPS** (time-sliced) | ~7.0 s | **16.8 s** |
-| **with MPS** (concurrent) | ~4.0 s (≈ solo 3.2 s) | **8.6 s** |
+| | aggregate |
+|---|---|
+| 1 tenant (solo) | 7 218 it/s |
+| 2 tenants, time-sliced (no MPS) | 3 559 it/s |
+| 2 tenants, **MPS** | **14 410 it/s** |
 
-MPS ≈ **2× throughput** for the co-located pair — the concurrency that makes
-spatial TPC partitioning meaningful. (`%smid` is client-relative under MPS, so
-disjointness is shown by throughput, not raw SM ids.)
+MPS gives **4.05× time-slicing** (and 2.0× a single tenant, i.e. genuine
+concurrency) — the property that makes spatial TPC partitioning meaningful. Full
+numbers in [docs/BENCHMARKS.md §5](docs/BENCHMARKS.md). (`%smid` is client-relative
+under MPS, so disjointness shows up as throughput, not raw SM ids.)
 
 ## 3. Kernel Atomizer (Section 5.4 / 6) — working end-to-end
 
@@ -204,8 +218,8 @@ The mechanism, all verified empirically:
   ([`src/atomize_splice.c`](src/atomize_splice.c)) and the modified cubin is
   loaded. **All three image kinds are handled** ([`src/fatbin.c`](src/fatbin.c)):
   raw ELF cubins directly; **fatbins** (as PyTorch/TensorRT ship) by extracting
-  the cubin for the running SM — **LZ4-decompressing** it if flagged (NVIDIA's
-  fatbin compression is plain LZ4 block format); and **PTX** (or a PTX-only
+  the cubin for the running SM — decompressing it if flagged (**LZ4 block** on
+  CUDA ≤ 12, **Zstandard** on CUDA 13); and **PTX** (or a PTX-only
   fatbin) by JIT-compiling it to a cubin with the driver linker (`cuLink*`). In
   every case we hand the driver a bare (spliced) cubin — no fatbin repackaging
   needed. Anything unrecognized loads verbatim (correct, just not atomized). ✅
@@ -346,8 +360,9 @@ above makes this moot** by never transferring in the first place.
 
 Frameworks sit on the CUDA **Runtime** (`libcudart`), which reaches the driver in
 ways that bypass naive public-API interposition. Making the atomizer + scheduler
-work transparently under them required closing three gaps (all in
-[`src/interpose.c`](src/interpose.c) / [`src/fatbin.c`](src/fatbin.c)):
+work transparently under them required closing four gaps (in
+[`src/interpose.c`](src/interpose.c) / [`src/fatbin.c`](src/fatbin.c) /
+[`src/atomizer.c`](src/atomizer.c)):
 
 1. **Wrapper, not `LD_PRELOAD`.** `libcudart` `dlopen`s `libcuda.so.1` *by name*
    and `dlsym`s the driver, so `LD_PRELOAD` of our `.so` is invisible. We ship a
@@ -364,6 +379,20 @@ work transparently under them required closing three gaps (all in
    follow the wrapper, and gate each launch. (`cuGetExportTable`'s callback table
    `2c8e0ad8…` is the same low-level hook `libsmctrl`/`qmd.c` use for TPC masking —
    it fires for *every* launch regardless of API.)
+4. **Kernel handles that arrive without a name.** Splicing a module is only half
+   the job: at launch we must recognise the `CUfunction` as one whose module we
+   spliced. Intercepting the APIs that hand out handles *by name*
+   (`cuModuleGetFunction`, `cuLibraryGetKernel`, `cuKernelGetFunction`) is not
+   enough — CUDA 12 also offers **bulk enumeration** (`cuLibraryEnumerateKernels`,
+   `cuLibraryGetKernelCount`), which returns handles with **no names at all**, and
+   cuFFT uses it. Its kernels were therefore treated as "not ours" and ran at
+   **0 % coverage** — while still computing the right answer, so nothing looked
+   broken. Chasing each new enumeration API is a losing game, so an unrecognised
+   handle is now classified by asking the driver directly: `cuFuncGetModule` gives
+   the module it came from and `cuFuncGetName` its name, which is exactly what the
+   named path would have used. This is done **once per distinct handle** (the
+   result is memoised), and it closes the whole class, including APIs that do not
+   exist yet. `LITHOS_DIAG=1` shows these as `byHandle`.
 
 Robustness for real kernels: splicing is **per-kernel** — only the kernels we
 successfully splice are gated, so a module with one odd kernel still atomizes the
@@ -440,10 +469,37 @@ launch, how many kernels were split / single-atom / full-range / un-atomized):
 | **vLLM 0.8.5** (PagedAttention + custom kernels) | offline generation, **eager** and **CUDA-graph** decode | ✅ correct in both modes, output == baseline | **100%** — eager 422 kernels (512/512), **graph 439 kernels, 1397 launches split (3328/3328)** |
 | **+ `LITHOS_QUOTA`** | any framework under a TPC quota | ✅ correct *and* confined (SM-probe: 4→8, 8→16 SMs) | — |
 
-**Every kernel of every framework is atomized (0 un-atomized).** They all load
-their kernels through `cuLibraryLoadData`/`cuModuleLoadData` (fatbins), which the
-splicer handles, so nothing slips through. Each LithOS component — interposition /
-atomizer / scheduler / CUDA graphs / end-to-end — passes for all of them.
+**Every kernel of every framework is atomized (0 un-atomized).** Each LithOS
+component — interposition / atomizer / scheduler / CUDA graphs / end-to-end —
+passes for all of them.
+
+That result is *not* explained by "they all load through
+`cuLibraryLoadData`/`cuModuleLoadData`, so nothing slips through" — an earlier
+version of this section said so, and it is wrong. Loading was never the hard part;
+**recognising the kernel handle at launch** is, and a library can obtain that
+handle without ever naming it (gap 4 above). cuFFT does exactly that and ran at
+0 % coverage until the by-handle fallback existed, with correct output throughout.
+Coverage is what makes this visible, which is why it is reported next to every
+correctness result here.
+
+### Re-validated on the A100 (`bash bench/fw_all.sh`)
+
+Four targets × eight LithOS configurations, **32/32 PASS at 100 % coverage**
+(A100 80GB PCIe, driver 570.195.03). Each target was chosen for a *different*
+route to the GPU:
+
+| target | reaches the GPU via | launches |
+|---|---|---|
+| cuBLAS | fatbin kernels fetched **by name** | 3 |
+| cuFFT | kernels fetched by **bulk enumeration**, unnamed | 2 |
+| PyTorch 2.13.0+cu126 | cuBLAS + cuDNN + ATen + autograd + CUDA graphs | 63 |
+| Triton 3.7.1 | cubins **JIT-compiled at run time** | 18 |
+
+Configs: default, `ATOM_US=1`, `QUOTA=16`, right-sizing, dispatcher, dispatcher
+with 4 workers, predictor, and all at once. Two concurrent PyTorch tenants also
+receive disjoint ranges `[0,16)`/`[16,32)` from the coordinator with **no**
+hand-assigned `LITHOS_TPC_BASE`. See [FINDINGS §5](docs/FINDINGS.md) for the three
+bugs this harness caught that the unit suite could not.
 
 ## Configuration (environment variables)
 
@@ -452,26 +508,47 @@ atomizer / scheduler / CUDA graphs / end-to-end — passes for all of them.
 | `LITHOS_VERBOSE` | 0 | log interposition / scheduler / atomizer activity |
 | `LITHOS_ATOMIZER` | 1 | enable the atomizer (module-load cubin splice + per-atom launch) |
 | `LITHOS_ATOM_US` | 300 | target atom duration (µs); paper uses 250–500 |
+| `LITHOS_SLO_US` | 0 | **latency budget** this process may impose on a co-located tenant. Caps atom duration, because a latency-critical neighbour waits behind at most **one atom** (0 = off) |
+| `LITHOS_ATOM_COST_US` | 5 | measured cost of one extra atom (the early-exit full-grid relaunch) |
+| `LITHOS_ATOM_MAX_OVERHEAD` | 0.10 | cap splitting overhead at this fraction of the kernel's runtime; sets a **floor** on atom duration (0 = no floor) |
 | `LITHOS_MIN_BLOCKS` | 8 | skip atomization below this grid size |
 | `LITHOS_FORCE_ATOMS` | 0 | force an exact atom count, overriding the duration heuristic (0 = auto; testing/policy) |
 | `LITHOS_ATOM_TPC` | 0 | **per-atom TPC allocation**: give each atom of a kernel a distinct *W*-TPC slice, tiled (with wraparound) across the process's TPC span (0 = off; all atoms share the stream's mask) |
 | `LITHOS_ATOM_TPC_LIST` | — | **variable** per-atom widths, e.g. `1,2,3` → atom *i* gets `list[i % n]` TPCs, packed contiguously and cycled (overrides `LITHOS_ATOM_TPC`) |
-| `LITHOS_ATOM_JUMP` / `LITHOS_BRX` | 0 | *legacy* — drive the dead-end QMD-redirect+SASS-jump path (`legacy/`); unused by the splice atomizer |
 | `LITHOS_QUOTA` | −1 | per-stream TPC quota (compute quotas) |
 | `LITHOS_STEALING` | 1 | enable TPC stealing from idle streams (needs disjoint ranges — see `LITHOS_PERSTREAM_QUOTA`) |
+| `LITHOS_TPC_TIMERS` | 1 | **per-TPC timers** (§5.3): each launch publishes `now + predicted_duration` against the TPCs it occupies, and a steal skips any TPC whose timer has not expired. Closes the hole in idle-only detection — a stream that submits one long kernel and goes quiet reads as *idle* after 1 ms while its kernel still has milliseconds to run. Never restricts a stream's own quota. `0` = the older idle-only heuristic |
 | `LITHOS_PERSTREAM_QUOTA` | 0 | give **each stream** its own disjoint quota-sized TPC slice instead of one shared application-wide range. Required for intra-process TPC stealing to have anything to lend |
 | `LITHOS_PREDICT` | 1 | online latency prediction (§5.7): event-measured, operator-indexed; drives atom sizing/right-sizing/throttle |
 | `LITHOS_RIGHTSIZE` | 0 | per-kernel TPC right-sizing (§5.5): occupancy filter + `l=m/t+b` scaling model |
 | `LITHOS_SLIP` | 1.1 | right-sizing latency-slip factor `k` (e.g. 1.1 = tolerate 10% slowdown) |
 | `LITHOS_THROTTLE` | 0 | enforce the outstanding-work throttle (§5.3): defer dispatch while in-flight µs > limit |
-| `LITHOS_DISPATCH` | 0 | route launches through a single dispatcher thread (§5.2, hand-off) |
+| `LITHOS_DISPATCH` | 0 | buffer launches in per-stream launch queues and submit them from dispatcher threads (§5.2). The application's `cuLaunchKernel` returns as soon as the launch is queued |
+| `LITHOS_DISPATCH_THREADS` | 2 | dispatcher worker threads. Workers never drain the same launch queue concurrently, so this only adds parallelism across *streams* |
+| `LITHOS_DISPATCH_DEPTH` | 1024 | max launches buffered per queue before the submitting thread blocks. `1` makes deferral nearly synchronous — useful for isolating whether a bug is caused by buffering |
+| `LITHOS_DISPATCH_PRIO` | 1 | let stream priority choose what the dispatcher sends next. `0` makes every queue compare equal, so selection is purely by arrival order — the control condition for priority experiments. That is a *strict* global FIFO only with `LITHOS_DISPATCH_THREADS=1`; with more workers some reordering remains whatever this is set to, because a worker skips any queue another worker is already draining (measured: 0 reorders at 1 worker, ~750 at 4, with priority off in both) |
+| `LITHOS_PRIO` | 0 | default scheduling priority for streams the application did not prioritise itself (lower = more important, matching CUDA). Distinct from `LITHOS_PRIORITY`, which is this *tenant's* priority in the cross-application table |
 | `LITHOS_LOG_PREDICT` | 0 | log per-operator measured/EMA latencies |
+| `LITHOS_PREDICT_ACC` | 0 | log predicted-vs-measured pairs per launch, for scoring predictor accuracy (`bench/predacc.py`) |
+| `LITHOS_COORD` | 1 | join the **system-wide tenant table** (§5.1) so quotas and stealing span *applications*, not just streams. Assigns disjoint TPC ranges automatically — no manual `LITHOS_TPC_BASE` needed. 0 = per-process only |
+| `LITHOS_PRIORITY` | 0 | this tenant's priority (larger = higher). A higher-priority tenant's TPCs are never stolen, even while it is idle (§5.3) |
+| `LITHOS_LOG_COORD` | 0 | log coordinator registration and range assignment |
 | `LITHOS_TPC_BASE` | 0 | first TPC of this process's range (give concurrent processes disjoint ranges under MPS) |
 | `LITHOS_GRAPH_SUBGRAPHS` | 0 | **paper-model graph scheduling**: partition each instantiated CUDA graph into K subgraphs (topological cut) and give each subgraph its own TPC allocation, instead of atomizing kernels inside the graph. Kernels run whole; the subgraph is the scheduling unit. Reallocates on replay by re-instantiating only the changed subgraphs |
 | `LITHOS_SUBGRAPH_ROTATE` | 0 | demo: rotate each subgraph's TPC allocation every replay (stands in for a live scheduler changing allocations), which exercises the runtime re-instantiation path |
+| `LITHOS_MPS` | 1 | auto-start the MPS control daemon on init; `0` disables (see [BENCHMARKS §8](docs/BENCHMARKS.md) for the pipe/log-directory caveat) |
+| `LITHOS_STATS` | 0 | print the coverage summary to stderr at exit: distinct kernels by class, launches by class, and **atomization coverage**. The first thing to check when LithOS appears to do nothing |
+| `LITHOS_STATS_FILE` | — | also dump that summary periodically to `<file>.<pid>`, so coverage survives a subprocess that is *killed* rather than exited (e.g. vLLM's EngineCore). One file per pid, so a launch-free parent cannot overwrite the worker's numbers |
+| `LITHOS_DIAG` | 0 | diagnose *why* coverage is what it is: image kinds and splice time at module load, the class assigned to each kernel and how it was decided (by name, or `byHandle` — see below), and the name of every kernel that ran un-atomized |
 | `LITHOS_LOG_MASK` | 0 | log the TPC disable-mask (and enabled-TPC list) applied to each launch — useful to observe per-atom/per-subgraph allocation |
 | `LITHOS_LOG_CB` / `LITHOS_LOG_GRAPH` | 0 | log every QMD pre-upload callback / graph-partition decision |
 | `LITHOS_OUTSTANDING_US` | 100 | outstanding-work throttle threshold |
+
+Debug / reverse-engineering knobs (not part of normal operation):
+`LITHOS_TRACE_GPA` logs every `cuGetProcAddress` lookup — the quickest way to tell
+whether the CUDA runtime is resolving through us at all; `LITHOS_TRACE_ET` traces
+`cuGetExportTable`; `LITHOS_QMD_PROG_OFF` and `LITHOS_CORRUPT_OFF` override/probe
+QMD byte offsets (used to derive the constants in `qmd.c`).
 
 ## Reverse-engineering probes
 

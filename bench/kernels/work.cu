@@ -1,0 +1,1 @@
+extern "C" __global__ void work(float* buf,int kid,int iters){int b=blockIdx.x*blockDim.x+threadIdx.x;float v=buf[b];for(int i=0;i<iters;i++)v=fmaf(v,1.0000001f,0.0000001f);buf[b]=v+(float)kid*1e-6f;}

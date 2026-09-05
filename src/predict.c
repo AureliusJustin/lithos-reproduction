@@ -49,6 +49,8 @@ static pthread_mutex_t g_pmtx = PTHREAD_MUTEX_INITIALIZER;
 typedef struct {
     int     slot, op, tpcs;
     unsigned gen;        /* batch generation this launch belongs to */
+    double  predicted_us;/* what we predicted for THIS launch (0 = no prediction) */
+    CUevent start_evt;   /* NULL unless this launch had no in-batch predecessor */
     CUevent done_evt;
     int     used;
 } Pend;
@@ -76,7 +78,8 @@ static int      g_prev_valid[P_STREAMS];
 static CUevent g_evpool[P_EVPOOL]; static int g_evpool_n;
 static pthread_mutex_t g_evmtx = PTHREAD_MUTEX_INITIALIZER;
 
-static double g_outstanding_us = 0;   /* in-flight work (us) */
+static double g_outstanding_us = 0;   /* in-flight work (us)                    */
+static int    g_outstanding_n  = 0;   /* in-flight LAUNCHES (see the throttle)   */
 static int    g_tracker_started = 0;
 static pthread_t g_tracker;
 
@@ -85,6 +88,7 @@ void predict_init(void) {
     memset(g_op_idx, 0, sizeof(g_op_idx));
     g_pend_head = g_pend_tail = g_evpool_n = 0;
     g_outstanding_us = 0;
+    g_outstanding_n = 0;
 }
 
 int predict_next_op(int slot) {
@@ -226,33 +230,38 @@ static void evt_put(CUevent e) {
 
 /* Queue one launch's completion event for the Tracker. `done_evt` must already
  * have been recorded on the launch stream AFTER the launch. */
-void predict_submit(int slot, int op, int tpcs, CUevent done_evt) {
-    if (!done_evt) return;
+void predict_submit(int slot, int op, int tpcs, CUevent start_evt, CUevent done_evt) {
+    if (!done_evt) { evt_put(start_evt); return; }
     /* Credit the estimated work immediately so the throttle sees this launch as
      * in flight right away; the estimate is corrected when the event is reaped. */
-    double est = predict_lookup(slot, op, tpcs, 0);
-    if (est <= 0) est = 20.0;   /* unknown operator: assume ~20 us in flight */
+    double est_at_submit = predict_lookup(slot, op, tpcs, 0);   /* scored on reap */
+    double est = est_at_submit > 0 ? est_at_submit : 20.0;  /* unknown: ~20us in flight */
 
     pthread_mutex_lock(&g_pendmtx);
     int next = (g_pend_head + 1) % P_PEND;
     if (next == g_pend_tail) {          /* ring full: drop this measurement */
         pthread_mutex_unlock(&g_pendmtx);
-        evt_put(done_evt);
+        evt_put(start_evt); evt_put(done_evt);
         return;
     }
     unsigned gen = (slot >= 0 && slot < P_STREAMS)
                  ? __atomic_load_n(&g_batch_gen[slot], __ATOMIC_RELAXED) : 0;
-    g_pend[g_pend_head] = (Pend){ slot, op, tpcs, gen, done_evt, 1 };
+    g_pend[g_pend_head] = (Pend){ slot, op, tpcs, gen, est_at_submit, start_evt, done_evt, 1 };
     g_pend_head = next;
     pthread_mutex_unlock(&g_pendmtx);
 
     pthread_mutex_lock(&g_pmtx);
     g_outstanding_us += est;
+    g_outstanding_n++;
     pthread_mutex_unlock(&g_pmtx);
 }
 
 double predict_outstanding_us(void) {
     pthread_mutex_lock(&g_pmtx); double v = g_outstanding_us; pthread_mutex_unlock(&g_pmtx);
+    return v;
+}
+int predict_outstanding_n(void) {
+    pthread_mutex_lock(&g_pmtx); int v = g_outstanding_n; pthread_mutex_unlock(&g_pmtx);
     return v;
 }
 
@@ -277,13 +286,43 @@ static int reap_one(void) {
      * completion itself still counts — this event simply becomes the reference
      * for the next one. */
     int valid_slot = (p.slot >= 0 && p.slot < P_STREAMS);
-    if (valid_slot && g_prev_valid[p.slot]) {
+    int scored = 0;
+
+    /* A launch with no in-batch predecessor carries its own start event, so it can
+     * still be timed directly. Without this, workloads that sync after EVERY
+     * launch (latency-critical inference) would never be measured at all — every
+     * launch is the first of its batch, so there is no previous completion to
+     * difference against. */
+    if (p.start_evt) {
+        float ms = 0;
+        if (cuEventElapsedTime(&ms, p.start_evt, p.done_evt) == CUDA_SUCCESS && ms >= 0) {
+            double actual_us = ms * 1000.0;
+            if (p.predicted_us > 0 && getenv("LITHOS_PREDICT_ACC"))
+                fprintf(stderr, "[acc] slot=%d op=%d tpc=%d pred=%.1f actual=%.1f err=%.1f\n",
+                        p.slot, p.op, p.tpcs, p.predicted_us, actual_us, p.predicted_us - actual_us);
+            predict_record(p.slot, p.op, p.tpcs, actual_us);
+            scored = 1;
+        }
+        evt_put(p.start_evt);
+    }
+
+    if (!scored && valid_slot && g_prev_valid[p.slot]) {
         /* Only difference against the previous completion if it belongs to the
          * SAME batch — otherwise the gap spans a sync and is idle time. */
         if (g_prev_gen[p.slot] == p.gen) {
             float ms = 0;
-            if (cuEventElapsedTime(&ms, g_prev_evt[p.slot], p.done_evt) == CUDA_SUCCESS && ms >= 0)
-                predict_record(p.slot, p.op, p.tpcs, ms * 1000.0);
+            if (cuEventElapsedTime(&ms, g_prev_evt[p.slot], p.done_evt) == CUDA_SUCCESS && ms >= 0) {
+                double actual_us = ms * 1000.0;
+                /* Prediction accuracy, scored the way the paper does: compare the
+                 * prediction MADE FOR THIS LAUNCH against the measured duration.
+                 * Emitted as one line per launch so an external script can compute
+                 * misprediction rate and error percentiles. */
+                if (p.predicted_us > 0 && getenv("LITHOS_PREDICT_ACC"))
+                    fprintf(stderr, "[acc] slot=%d op=%d tpc=%d pred=%.1f actual=%.1f err=%.1f\n",
+                            p.slot, p.op, p.tpcs, p.predicted_us, actual_us,
+                            p.predicted_us - actual_us);
+                predict_record(p.slot, p.op, p.tpcs, actual_us);
+            }
         }
         evt_put(g_prev_evt[p.slot]);         /* recycle the old reference */
     }
@@ -302,6 +341,7 @@ static int reap_one(void) {
     pthread_mutex_lock(&g_pmtx);
     g_outstanding_us -= est;
     if (g_outstanding_us < 0) g_outstanding_us = 0;
+    if (g_outstanding_n > 0) g_outstanding_n--;
     pthread_mutex_unlock(&g_pmtx);
 
     pthread_mutex_lock(&g_pendmtx);
@@ -313,6 +353,12 @@ static int reap_one(void) {
 static CUcontext g_track_ctx = NULL;
 static void* tracker_main(void* arg) {
     (void)arg;
+    /* The Tracker's cuEventQuery/cuEventElapsedTime resolve to LithOS's own
+     * ordering barriers, which would drain the launch queues — and deadlock,
+     * since the dispatcher is waiting on the outstanding-work count that only
+     * this thread can lower. Mark the thread internal so they pass through.
+     * See the re-entrancy guard in lithos.h. */
+    lithos_internal_begin();
     if (g_track_ctx) cuCtxSetCurrent(g_track_ctx);   /* events are context-bound */
     for (;;) {
         int did = 0;

@@ -11,8 +11,12 @@
  *   - LibLithOS interposes the CUDA Driver API (Section 5.2 / 6).
  *   - Launch queues buffer work and decouple submission from execution.
  *   - The TPC Scheduler dispatches at TPC granularity (Section 5.3).
- *   - The Kernel Atomizer splits kernels into atoms via a Prelude kernel and
- *     QMD program-address patching (Section 5.4 / 6), fully transparently.
+ *   - The Kernel Atomizer splits kernels into atoms (Section 5.4 / 6), fully
+ *     transparently. NOTE: the paper reaches the atom's range check by patching
+ *     the QMD program address to a "Prelude" kernel that JUMPS into the original;
+ *     we instead SPLICE the range check into each kernel's own machine code so
+ *     in-range blocks fall through. Same semantics, no control transfer — see
+ *     docs/FIDELITY.md and src/atomize_splice.c.
  */
 #ifndef LITHOS_H
 #define LITHOS_H
@@ -25,24 +29,24 @@ extern "C" {
 #endif
 
 /* ------------------------------------------------------------------ */
-/*  Kernel Atomizer: metadata handed to the Prelude kernel            */
+/*  Kernel Atomizer: the per-atom metadata the spliced prologue reads  */
 /* ------------------------------------------------------------------ */
 /*
- * Algorithm 1 in the paper. The Prelude reads this struct from a fixed device
- * address, checks whether its linear block index falls inside [lo, hi), and if
- * so branches into the original kernel entry point (retaining the original
- * kernel's resources). Otherwise it early-exits.
+ * Algorithm 1's range gate. The spliced-in prologue reads this from a FIXED
+ * device address (baked into its SASS as a literal), checks whether its linear
+ * block index falls inside [lo, hi), and EXITs if not; in-range blocks fall
+ * through into the original kernel body.
  *
- * `kernel_entrypoint` is the device address of the original kernel's SASS as
- * read out of the QMD before we patch it.
+ * Only these two words exist on the device — the atomizer writes them with two
+ * cuMemsetD32Async immediates before each atom's relaunch. The paper's Prelude
+ * additionally needs the original kernel's entry point (it JUMPS there); our
+ * fall-through splice needs no entry point, no generation counter, and no
+ * out-of-range target, so those fields are deliberately absent. See
+ * docs/FIDELITY.md for why the jump could not be reproduced.
  */
 typedef struct AtomMetadata {
     uint32_t block_idx_lo;   /* first linear block index that does real work  */
     uint32_t block_idx_hi;   /* one past the last (exclusive)                 */
-    uint32_t generation;     /* bumped every launch so device sees fresh data */
-    uint32_t _pad;
-    uint64_t kernel_entrypoint; /* original QMD program address (device VA)   */
-    uint64_t noop_entrypoint;   /* trivial kernel for out-of-range blocks     */
 } AtomMetadata;
 
 /* ------------------------------------------------------------------ */
@@ -61,18 +65,23 @@ typedef struct LithosKernel {
     /* Derived / scheduling state */
     uint64_t     total_blocks;   /* gridDimX*Y*Z                              */
     uint64_t     enqueue_ns;     /* when the app enqueued this kernel         */
-    double       pred_us;        /* predicted duration at current TPC alloc   */
-    int          n_atoms;        /* how many atoms to split into (>=1)        */
-    int          atomize;        /* 1 if this kernel should be atomized       */
+    double       pred_us;        /* predicted duration at the current TPC alloc;
+                                  * 0 = unknown, atomizer falls back to a stub */
 } LithosKernel;
 
 /* ------------------------------------------------------------------ */
 /*  Tunable parameters (Section 5.3 / 5.4)                            */
 /* ------------------------------------------------------------------ */
 typedef struct LithosConfig {
-    double   atom_duration_us;      /* target atom length; 250-500us effective*/
+    double   atom_duration_us;      /* target atom length; paper uses 250-500us */
+    double   slo_us;                /* LITHOS_SLO_US: max delay this process may impose
+                                     * on a co-located tenant. Caps atom duration, since
+                                     * an HP job waits behind at most one atom. 0 = off */
+    double   atom_cost_us;          /* LITHOS_ATOM_COST_US: measured cost of one extra
+                                     * atom (the early-exit full-grid relaunch)        */
+    double   atom_max_overhead;     /* LITHOS_ATOM_MAX_OVERHEAD: cap splitting overhead
+                                     * at this fraction of the kernel's runtime        */
     double   outstanding_limit_us;  /* sync-queue throttle; paper uses 100us  */
-    int      max_outstanding_atoms; /* cap on in-flight atoms                 */
     int      min_blocks_to_atomize; /* skip atomization for tiny grids        */
     int      enable_atomizer;
     int      force_atoms;           /* LITHOS_FORCE_ATOMS: override atom count (0=auto) */
@@ -81,14 +90,19 @@ typedef struct LithosConfig {
     int      atom_tpc_list_n;       /* number of entries in atom_tpc_list (0=off)        */
     int      graph_subgraphs;       /* LITHOS_GRAPH_SUBGRAPHS: partition graphs into K subgraphs (0=off) */
     int      enable_stealing;
+    int      tpc_timers;       /* LITHOS_TPC_TIMERS: per-TPC busy timers gate steals */
     int      predict;             /* LITHOS_PREDICT: online latency prediction (§5.7) */
     int      rightsize;           /* LITHOS_RIGHTSIZE: per-kernel TPC right-sizing (§5.5) */
     double   latency_slip;        /* LITHOS_SLIP: right-sizing latency-slip factor k    */
     int      throttle;            /* LITHOS_THROTTLE: enforce the outstanding-work limit */
-    int      dispatch;            /* LITHOS_DISPATCH: route launches through a dispatcher thread (§5.2) */
+    int      dispatch;            /* LITHOS_DISPATCH: buffer launches in launch queues, drained by a
+                                   * dispatcher thread (§5.2) */
+    int      dispatch_prio;       /* LITHOS_DISPATCH_PRIO: drain the queues by stream priority (1) or
+                                   * in strict arrival order (0). The control for the experiment:
+                                   * 0 keeps the deferral, drops the policy. */
+    int      coordinator;         /* LITHOS_COORD: join the system-wide tenant table (§5.1) */
+    int      priority;            /* LITHOS_PRIORITY: this tenant's priority (larger = higher) */
     int      perstream_quota;     /* LITHOS_PERSTREAM_QUOTA: give each stream its own disjoint TPC slice */
-    int      enable_jump;         /* attempt the Prelude->original transfer      */
-    int      use_brx;             /* 1 = patch CALL->BRX jump; 0 = keep the CALL  */
     int      verbose;
 } LithosConfig;
 
@@ -96,6 +110,36 @@ extern LithosConfig g_lithos_cfg;
 
 void lithos_config_init(void);       /* read env vars, set defaults          */
 uint64_t lithos_now_ns(void);        /* monotonic clock helper               */
+
+/* ------------------------------------------------------------------ */
+/*  Re-entrancy guard: LithOS calling CUDA through its own interposers */
+/* ------------------------------------------------------------------ */
+/*
+ * LithOS issues plenty of CUDA calls of its own — the atomizer writes each
+ * atom's block range with cuMemsetD32Async, the predictor records and reaps
+ * events, the graph scheduler re-instantiates execs. Those calls resolve to OUR
+ * exported symbols, not the driver's, because within the library a direct call
+ * to cuEventQuery binds to the definition in barrier.c.
+ *
+ * That matters once launches are buffered, because the ordering barriers drain
+ * the launch queues before forwarding. LithOS's own calls must not do that:
+ *
+ *   - it deadlocks. The Tracker thread calls cuEventQuery, which would wait for
+ *     the dispatcher to empty its queues; the dispatcher is waiting on the
+ *     outstanding-work throttle, which only falls when the Tracker reaps a
+ *     completion. Each waits for the other. (Observed, not hypothetical.)
+ *   - it is unnecessary. LithOS makes these calls at points where it has already
+ *     established the ordering it needs — the atom metadata write goes to the
+ *     same stream immediately before the atom, the completion event immediately
+ *     after the launch it times.
+ *
+ * So every entry point that runs LithOS's own CUDA work raises this thread-local
+ * flag, and the barriers pass straight through while it is set. It counts rather
+ * than toggles so nesting is safe.
+ */
+extern __thread int g_lithos_internal;
+static inline void lithos_internal_begin(void) { g_lithos_internal++; }
+static inline void lithos_internal_end(void)   { g_lithos_internal--; }
 
 /* Per-atom TPC allocation: called by the atomizer before each atom's relaunch so
  * every atom of ONE kernel can be confined to a DISTINCT TPC set (the paper's

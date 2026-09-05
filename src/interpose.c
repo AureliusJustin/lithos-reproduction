@@ -28,6 +28,8 @@
 #include "lithos.h"
 #include "atomizer.h"
 #include "predict.h"
+#include "dispatch.h"
+#include "barrier.h"
 
 #define LOG(...) do { if (g_lithos_cfg.verbose) { \
     fprintf(stderr, "[lithos] " __VA_ARGS__); fputc('\n', stderr); } } while (0)
@@ -104,7 +106,8 @@ CUresult cuStreamCreateWithPriority(CUstream* phStream, unsigned int flags, int 
 
 CUresult cuStreamDestroy_v2(CUstream hStream) {
     ensure_init();
-    lithos_stream_sync(hStream);        /* drain the launch queue first */
+    lithos_stream_sync(hStream);        /* submit + wait for the buffered work */
+    dispatch_stream_destroyed(hStream); /* then retire its launch queue        */
     lithos_stream_destroyed(hStream);
     return g_real.cuStreamDestroy(hStream);
 }
@@ -353,6 +356,9 @@ CUresult cuGraphInstantiate_v2(CUgraphExec* pExec, CUgraph graph, CUgraphNode* e
 }
 CUresult cuGraphLaunch(CUgraphExec exec, CUstream stream) {
     ensure_init(); graph_resolve();
+    /* A graph launch is ordinary stream-ordered work: it must not overtake
+     * kernels still sitting in this stream's launch queue. */
+    if (dispatch_pending()) dispatch_drain(stream);
     if (lithos_graph_launch(exec, stream)) return CUDA_SUCCESS;
     return rg_launch(exec, stream);
 }
@@ -378,6 +384,10 @@ CUresult cuStreamBeginCapture_v2(CUstream s, CUstreamCaptureMode mode) {
     if (!rg_begin_capture)
         rg_begin_capture = (typeof(rg_begin_capture))lithos_real_sym("cuStreamBeginCapture_v2");
     predict_capture_begin();                 /* park the Tracker for the duration */
+    /* Close the launch queues for the duration too: which graph a launch is
+     * captured into depends on exactly when it is issued, so a buffered one
+     * could land in the wrong graph. Drains what is already queued. */
+    dispatch_capture_begin(s);
     return rg_begin_capture(s, mode);
 }
 CUresult cuStreamBeginCapture(CUstream s, CUstreamCaptureMode mode) {
@@ -388,6 +398,7 @@ CUresult cuStreamEndCapture(CUstream s, CUgraph* g) {
     if (!rg_end_capture)
         rg_end_capture = (typeof(rg_end_capture))lithos_real_sym("cuStreamEndCapture");
     CUresult r = rg_end_capture(s, g);
+    dispatch_capture_end();
     predict_capture_end();                   /* Tracker may resume */
     return r;
 }
@@ -473,8 +484,19 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion,
         if (strcmp(symbol, o->name) == 0) {
             *pfn = o->fn;   /* hand the app *our* wrapper */
             LOG("cuGetProcAddress(%s) -> LithOS wrapper", symbol);
-            break;
+            return r;
         }
+    }
+    /* Ordering barriers (barrier.def). Capture the real pointer the driver was
+     * about to return before replacing it: it is the ABI this caller actually
+     * asked for — notably the _ptsz variant when the process was built with
+     * --default-stream per-thread — and that is what the forwarder must call. */
+    BarrierFn* b = barrier_lookup(symbol);
+    if (b) {
+        if (!__atomic_load_n(&b->real, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&b->real, *pfn, __ATOMIC_RELEASE);
+        *pfn = b->wrapper;
+        LOG("cuGetProcAddress(%s) -> LithOS ordering barrier", symbol);
     }
     return r;
 }

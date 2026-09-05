@@ -63,30 +63,50 @@ uint64_t compute_disable_mask_ex(StreamState* st, uint64_t now, int allow_steal)
 uint64_t compute_disable_mask(StreamState* st, uint64_t now);
 /* Disable-mask enabling exactly `w` TPCs starting at `base`. */
 uint64_t mask_first_tpcs(int base, int w);
+
+/* Per-TPC timers (§5.3): publish this launch's predicted completion against the
+ * TPCs its disable-mask leaves enabled, so other streams/tenants can avoid
+ * stealing TPCs that are still working. */
+uint64_t tpc_enabled_of(uint64_t disable_mask);
+void     tpc_mark_busy(uint64_t disable_mask, double pred_us, uint64_t now_ns);
 /* Right-sizing (§5.5): fewest TPCs this kernel should get; *probe is set when the
  * scaling model wants this launch forced to a particular TPC count to sample it. */
 int      rightsize_tpcs(CUfunction f, int block_threads, unsigned shmem, uint64_t blocks,
                         int slot, int op, int cur_tpc, int* probe);
 
 /* ---- sched.c -------------------------------------------------------------- */
-/* The real submit path. dispatch.c calls this from the dispatcher thread; with
- * the dispatcher disabled, lithos_submit_launch calls it inline. */
+/* The real submit paths, one per driver launch API. dispatch.c calls these from
+ * the dispatcher thread once a buffered launch is chosen; without the dispatcher
+ * (or for a launch that could not be buffered) they run inline on the caller.
+ *
+ * `on_dispatcher` says which: the dispatcher has already waited on the
+ * outstanding-work throttle before choosing, so the submit path must not wait
+ * again, whereas an inline caller has to do it itself. `enqueue_ns` is when the
+ * APPLICATION issued the launch, which is what queueing delay is measured from. */
 CUresult submit_launch_now(CUfunction f,
                            unsigned gx, unsigned gy, unsigned gz,
                            unsigned bx, unsigned by, unsigned bz,
                            unsigned shmem, CUstream stream,
-                           void** params, void** extra);
-/* Outstanding-work throttle (§5.3). Called by the DISPATCHER when one is running
- * (the paper's placement); the submit path calls it inline only when there is no
- * dispatcher thread to defer on. No-op unless LITHOS_THROTTLE is set. */
+                           void** params, void** extra,
+                           uint64_t enqueue_ns, int on_dispatcher);
+CUresult submit_launch_ex_now(const CUlaunchConfig* cfg, CUfunction f,
+                              void** params, void** extra, int on_dispatcher);
+CUresult submit_launch_coop_now(CUfunction f,
+                                unsigned gx, unsigned gy, unsigned gz,
+                                unsigned bx, unsigned by, unsigned bz,
+                                unsigned shmem, CUstream stream,
+                                void** params, int on_dispatcher);
+
+/* Outstanding-work throttle (§5.3). Called by the DISPATCHER before it chooses
+ * what to send (the paper's placement — waiting first is what lets work
+ * accumulate for the choice to act on); the submit path calls it inline only
+ * when a launch bypassed the dispatcher. No-op unless LITHOS_THROTTLE is set. */
 void throttle_wait(void);
 
-/* ---- dispatch.c ----------------------------------------------------------- */
-/* Hand a launch to the dispatcher thread and wait until it is submitted. */
-CUresult dispatch_submit(CUfunction f,
-                         unsigned gx, unsigned gy, unsigned gz,
-                         unsigned bx, unsigned by, unsigned bz,
-                         unsigned shmem, CUstream stream,
-                         void** params, void** extra);
+/* ---- sched_stream.c ------------------------------------------------------- */
+/* Scheduling priority of a stream's launch queue; lower value = higher priority,
+ * following cuStreamCreateWithPriority so the application's own declaration
+ * carries straight through. */
+int lithos_stream_prio(CUstream s);
 
 #endif /* LITHOS_SCHED_INTERNAL_H */
