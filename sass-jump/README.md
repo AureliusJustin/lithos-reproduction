@@ -5,8 +5,7 @@ address), which must then transfer control into the original kernel for in-range
 blocks. ptxas lowers the natural `((fn)e)()` to a `CALL`, and the original ends
 in `EXIT` (not `RET`), which faults. These harnesses reverse-engineer, at the
 SASS level, whether any control transfer can do this cleanly. See
-[../README.md](../README.md) §3 for the summary and the project memory for the
-full log.
+[../docs/TECHNICAL_REPORT.md](../docs/TECHNICAL_REPORT.md) §5.1 for the summary.
 
 Build each as: `gcc <file>.c ../src/qmd.c -o /tmp/x -I../src -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcuda -lnvrtc && /tmp/x`
 
@@ -19,9 +18,11 @@ Build each as: `gcc <file>.c ../src/qmd.c -o /tmp/x -I../src -I/usr/local/cuda/i
 | `trivial.c` | Even an **empty** original (`{}`) faults on `EXIT` after a CALL → not a target/args bug; it's the transfer's return/convergence state. |
 | `xfunc.c` | A **`BRX`** (register-indirect branch) with proper metadata jumps **cross-function** and runs the target (`0xFACE`) — the register-jump mechanism works, but a `BSSY` convergence barrier makes the `EXIT` fault. |
 | `inject.c` | ELF-surgery injector that adds the `EIATTR_INDIRECT_BRANCH_TARGETS` (`0x34`) attribute a bare `BRX` needs (`nvdisasm` confirms). |
-| `backward.c` | Backward `BRX` jumps (negative offset) land wrong — the offset direction matters. |
 | `brava.c` | A plain **`BRA`** (unconditional jump) patched over the CALL gives **`sync=0`, no fault** for several landings → a *fault-free* transfer is achievable (BRA pushes no return, sets no barrier). |
-| `brapatch.c` | Patching a **loaded** module's code via `cuMemcpyHtoD` fails with `ILLEGAL_ADDRESS` → can't fix up a `BRA` immediate at runtime. |
+| `braexact.c` | Tries a clean transfer with exact addressing: capture the load addresses, patch `CALL`→`BRA(orig_entry)`, reload at a (hoped-deterministic) VA and launch prelude → `BRA` → original. |
+| `splice_test.c`, `atom_complex_test.c` | Prove the **prologue-splice / fall-through** atomizer (see *Resolved* below). |
+
+Two further findings were established with harnesses that were not kept: backward `BRX` jumps (negative offset) land wrong, and patching a **loaded** module's code via `cuMemcpyHtoD` fails with `ILLEGAL_ADDRESS`, so a `BRA` immediate cannot be fixed up at runtime.
 
 ## ✅ Resolved (the splice makes the transfer moot)
 
