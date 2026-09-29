@@ -27,16 +27,6 @@ Two experiments need **root**, which they detect and skip cleanly without it:
 and stops the MPS daemon. Under `sudo`, remember that plain `sudo` strips `LD_*` —
 LithOS needs `sudo env LD_PRELOAD=… ` or `sudo env LD_LIBRARY_PATH=… `.
 
-## Reading the paper
-
-`LithOS - SOSP.pdf` is the reference for everything in `docs/TECHNICAL_REPORT.md`, and this node has
-no `pdftotext`/poppler. [`tools/extract_paper_text.py`](../tools/extract_paper_text.py)
-recovers the text with nothing but `zlib`:
-
-```sh
-python3 tools/extract_paper_text.py "LithOS - SOSP.pdf" lithos-paper.txt
-```
-
 All harnesses run **from the repo root** and find their cubin in `build/kernels/`
 (override with `LITHOS_BENCH_CUBIN=/path/to.cubin`).
 

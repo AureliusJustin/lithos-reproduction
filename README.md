@@ -83,7 +83,6 @@ Everything is configured through environment variables (all defined in
 | `bench/` | benchmark and experiment harnesses — see [bench/README.md](bench/README.md) |
 | `docs/TECHNICAL_REPORT.md` | how the system works: modules, control flow, atomizer, framework validation |
 | `sass-jump/`, `legacy/` | record of the SASS-transfer dead end and the superseded QMD-redirect atomizer |
-| `tools/` | helper for extracting text from the paper PDF |
 | `LithOS - SOSP.pdf` | the paper |
 
 ## Acknowledgements
