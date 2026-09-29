@@ -13,3 +13,6 @@
 
 # Claude session files
 .claude/
+# Python bytecode
+__pycache__/
+*.pyc
