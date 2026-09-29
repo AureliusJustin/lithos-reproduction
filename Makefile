@@ -23,7 +23,7 @@ all: $(BUILD)/liblithos_full.so $(BUILD)/libcuda.so.1 tests
 FULL_SRC := src/interpose.c src/real.c src/config.c src/barrier.c src/params.c \
             src/sched.c src/sched_stream.c src/tpc_alloc.c src/dispatch.c \
             src/atomizer.c src/atomize_splice.c src/fatbin.c src/qmd.c \
-            src/graphsched.c src/predict.c src/coord.c
+            src/graphsched.c src/predict.c src/coord.c src/power.c
 
 # liblithos_full.so: LD_PRELOAD in front of a driver-API app.
 $(BUILD)/liblithos_full.so: $(FULL_SRC) src/*.h | $(BUILD)
@@ -46,7 +46,7 @@ tests: $(BUILD)/test_interpose $(BUILD)/test_interpose_driver \
        $(BUILD)/atomize_mark.ptx $(BUILD)/test_scheduler \
        $(BUILD)/correctness_matrix $(BUILD)/test_stealing $(BUILD)/steal_probe.cubin \
        $(BUILD)/test_dispatch_order $(BUILD)/test_dispatch_mt $(BUILD)/order_probe.cubin \
-       $(BUILD)/test_tpc_timers
+       $(BUILD)/test_tpc_timers $(BUILD)/atom_mask_probe $(BUILD)/latecomer $(BUILD)/longk
 
 # CUDA-runtime apps (exercise the libcuda.so.1 wrapper path used by frameworks)
 $(BUILD)/test_interpose: tests/test_interpose.cu | $(BUILD)
@@ -86,6 +86,16 @@ $(BUILD)/test_tpc_timers: tests/test_tpc_timers.c | $(BUILD)
 	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
 $(BUILD)/test_scheduler: tests/test_scheduler.c | $(BUILD)
 	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
+# Every atom must carry the scheduler's TPC allocation: the QMD next-mask is
+# one-shot, so a launch path that arms it once lets atoms 1..n-1 escape the quota.
+$(BUILD)/atom_mask_probe: tests/atom_mask_probe.c | $(BUILD)
+	$(CC) -O2 $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
+# Figure 10(c): one long atomized kernel, and a neighbour that arrives part-way
+# through it.
+$(BUILD)/longk: tests/longk.c | $(BUILD)
+	$(CC) -O2 $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
+$(BUILD)/latecomer: tests/latecomer.c | $(BUILD)
+	$(CC) -O2 $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
 # Ordering regression for buffered launches (Sec 5.2): proves no memcpy/event/
 # query can overtake a launch still sitting in a LithOS launch queue.
 $(BUILD)/test_dispatch_order: tests/test_dispatch_order.c | $(BUILD)
@@ -98,15 +108,16 @@ $(BUILD)/test_dispatch_mt: tests/test_dispatch_mt.cu | $(BUILD)
 	$(NVCC) -arch=$(ARCH) -O2 $< -o $@ -lcudart
 
 # ----------------------------------------------------------------------
-#  Benchmarks (docs/BENCHMARKS.md). Built on demand: `make bench`
+#  Benchmarks (docs/TECHNICAL_REPORT.md). Built on demand: `make bench`
 # ----------------------------------------------------------------------
 BENCH_BINS := $(BUILD)/launchbench $(BUILD)/modload $(BUILD)/graphprof \
               $(BUILD)/scalebench $(BUILD)/heavybench $(BUILD)/hpbench \
               $(BUILD)/beload $(BUILD)/tenant $(BUILD)/batchbench $(BUILD)/stealbench \
-              $(BUILD)/dispatchbench $(BUILD)/idler
+              $(BUILD)/dispatchbench $(BUILD)/idler $(BUILD)/fixedwork
 BENCH_CUBINS := $(BUILD)/kernels/work.cubin $(BUILD)/kernels/probe_smid.cubin \
                 $(BUILD)/kernels/detk.cubin $(BUILD)/kernels/mm.cubin \
-                $(BUILD)/kernels/nullk.cubin
+                $(BUILD)/kernels/nullk.cubin $(BUILD)/kernels/membound.cubin \
+                $(BUILD)/kernels/randacc.cubin
 
 .SECONDARY: $(BENCH_BINS) $(BENCH_CUBINS)   # pattern-rule outputs are not intermediates
 .PHONY: bench
@@ -147,6 +158,14 @@ run_tests: all
 	LITHOS_DISPATCH=1 ORDER_CUBIN=$(BUILD)/order_probe.cubin LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_dispatch_order
 	@echo "== Dispatcher: every worker submits the launches it takes (5.2) =="
 	LITHOS_DISPATCH=1 LITHOS_DISPATCH_THREADS=4 LD_LIBRARY_PATH=$(BUILD) $(BUILD)/test_dispatch_mt
+	@echo "== Every atom carries the TPC allocation, on both launch APIs (5.2) =="
+	bash tests/test_atom_mask.sh
+	@echo "== Figure 10(c): a kernel's TPC allocation changes mid-execution (5.4) =="
+	$(MAKE) -s $(BUILD)/latecomer $(BUILD)/longk $(BUILD)/kernels/work.cubin
+	bash tests/test_fig10c.sh
+	@echo "== Transparent power management: DVFS by the 5.6 scaling model =="
+	$(MAKE) -s $(BUILD)/tenant $(BUILD)/kernels/work.cubin
+	bash tests/test_dvfs.sh
 	@echo "== System-wide coordinator: cross-app quotas, stealing, priority (5.1) =="
 	$(MAKE) -s $(BUILD)/idler $(BUILD)/tenant $(BUILD)/kernels/work.cubin
 	bash tests/test_coord.sh
