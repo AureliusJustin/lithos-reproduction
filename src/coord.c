@@ -231,6 +231,12 @@ uint64_t coord_stealable_tpcs(uint64_t now_ns, uint64_t idle_ns) {
  * timers. Same shape as the shared array, so both paths share all the logic. */
 static uint64_t g_local_busy[COORD_MAX_TPCS];
 
+/* Ceiling on how far ahead a TPC may be declared busy (see coord_mark_tpcs_busy).
+ * Generous next to an atom (hundreds of microseconds) and next to the 100 us
+ * outstanding-work limit, but short enough that a bad prediction cannot park a
+ * TPC for a whole training step. */
+#define COORD_BUSY_HORIZON_NS  (200ull * 1000 * 1000)   /* 200 ms */
+
 static uint64_t* busy_array(void) {
     return (g_active && g_shm) ? g_shm->tpc_busy_until : g_local_busy;
 }
@@ -240,16 +246,40 @@ static uint64_t* busy_array(void) {
  * torn or stale read can only make a TPC look busier or freer than it is for one
  * launch, and either mistake is corrected by the next submission. Taking the
  * coordinator mutex here would put a cross-process lock on every launch. */
-void coord_mark_tpcs_busy(uint64_t tpc_mask, uint64_t until_ns) {
+/* A queued launch EXTENDS a TPC's busy horizon; it does not merely propose a
+ * deadline of its own.
+ *
+ * The distinction decides whether the timers work at all. A launch is timed at
+ * SUBMISSION, but it does not start then — it starts when the work already
+ * queued ahead of it on that TPC has drained. Publishing `now + duration` (the
+ * original form) therefore describes a kernel that runs immediately, which is
+ * true only for an empty queue. Submit 200 short kernels in a burst and every
+ * one of them claims the TPC for the same quarter-millisecond starting now, so
+ * the whole 50 ms of queued work reads as ~0.25 ms of busy — and a neighbour
+ * scanning a moment later sees a free TPC and steals it, landing behind all of
+ * it. That is precisely the head-of-line blocking §5.3 introduces these timers
+ * to avoid.
+ *
+ * Accumulating instead — start = max(now, current horizon), new horizon =
+ * start + duration — makes the horizon track the depth of the queue, which is
+ * what "estimating kernel (and atom) durations at submission time" has to mean
+ * for the estimate to be usable.
+ *
+ * The horizon is capped so a tenant whose predictions run long cannot pin its
+ * TPCs indefinitely: a stale timer only ever costs work conservation, and the
+ * cap bounds how long that can last. */
+void coord_mark_tpcs_busy(uint64_t tpc_mask, uint64_t now_ns, uint64_t dur_ns) {
     uint64_t* busy = busy_array();
+    uint64_t  cap  = now_ns + COORD_BUSY_HORIZON_NS;
     while (tpc_mask) {
         int t = __builtin_ctzll(tpc_mask);
         tpc_mask &= tpc_mask - 1;
         if (t >= COORD_MAX_TPCS) break;
-        /* Later deadline wins: two kernels queued on the same TPC mean it is busy
-         * until the LAST one finishes, not the first. */
-        if (until_ns > __atomic_load_n(&busy[t], __ATOMIC_RELAXED))
-            __atomic_store_n(&busy[t], until_ns, __ATOMIC_RELAXED);
+        uint64_t cur   = __atomic_load_n(&busy[t], __ATOMIC_RELAXED);
+        uint64_t start = cur > now_ns ? cur : now_ns;   /* queued behind the rest */
+        uint64_t until = start + dur_ns;
+        if (until > cap) until = cap;
+        if (until > cur) __atomic_store_n(&busy[t], until, __ATOMIC_RELAXED);
     }
 }
 

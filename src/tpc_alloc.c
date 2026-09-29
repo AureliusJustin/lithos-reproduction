@@ -33,7 +33,7 @@
  * (H100 = 66 TPCs): qmd.c already writes Hopper's two "extended" mask words as
  * all-ones, so TPCs 64+ stay permanently ENABLED and simply cannot be masked
  * off. Supporting them means widening this mask (and the qmd_set_*_mask API)
- * past 64 bits. Flagged in docs/FIDELITY.md rather than silently mis-scheduling. */
+ * past 64 bits. Flagged in docs/TECHNICAL_REPORT.md rather than silently mis-scheduling. */
 static uint64_t all_tpcs_bits(void) {
     return (g_num_tpcs >= 64) ? ~0ull : ((1ull << g_num_tpcs) - 1);
 }
@@ -111,8 +111,8 @@ uint64_t tpc_enabled_of(uint64_t disable_mask) {
  * publish nothing and stealing falls back to the idle checks for that launch. */
 void tpc_mark_busy(uint64_t disable_mask, double pred_us, uint64_t now_ns) {
     if (!g_lithos_cfg.tpc_timers || pred_us <= 0) return;
-    coord_mark_tpcs_busy(tpc_enabled_of(disable_mask),
-                         now_ns + (uint64_t)(pred_us * 1000.0));
+    coord_mark_tpcs_busy(tpc_enabled_of(disable_mask), now_ns,
+                         (uint64_t)(pred_us * 1000.0));
 }
 
 /* Disable-mask that enables exactly `w` TPCs starting at `base` (right-sizing). */
@@ -214,9 +214,14 @@ int rightsize_tpcs(CUfunction f, int block_threads, unsigned shmem, uint64_t blo
     *probe = 0;
     if (cur_tpc < 2 || block_threads < 1) return cur_tpc;   /* nothing to shrink */
 
-    /* Stage 1: occupancy-based upper bound on useful TPCs. */
+    /* Stage 1: occupancy-based upper bound on useful TPCs.
+     *
+     * LITHOS_RIGHTSIZE_OCC=0 skips it, leaving stage 2 to decide alone. The two
+     * stages disagree sharply on real kernels (BENCHMARKS §18), so they have to be
+     * separately measurable. */
     int blocks_per_sm = 0;
-    if (cuOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, f, block_threads, shmem)
+    if (g_lithos_cfg.rightsize_occ &&
+        cuOccupancyMaxActiveBlocksPerMultiprocessor(&blocks_per_sm, f, block_threads, shmem)
             == CUDA_SUCCESS && blocks_per_sm > 0) {
         int blocks_per_tpc = blocks_per_sm * 2;             /* 2 SMs per TPC */
         int useful = (int)((blocks + blocks_per_tpc - 1) / blocks_per_tpc);

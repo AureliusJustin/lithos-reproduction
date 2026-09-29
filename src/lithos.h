@@ -16,7 +16,7 @@
  *     the QMD program address to a "Prelude" kernel that JUMPS into the original;
  *     we instead SPLICE the range check into each kernel's own machine code so
  *     in-range blocks fall through. Same semantics, no control transfer — see
- *     docs/FIDELITY.md and src/atomize_splice.c.
+ *     docs/TECHNICAL_REPORT.md and src/atomize_splice.c.
  */
 #ifndef LITHOS_H
 #define LITHOS_H
@@ -42,7 +42,7 @@ extern "C" {
  * additionally needs the original kernel's entry point (it JUMPS there); our
  * fall-through splice needs no entry point, no generation counter, and no
  * out-of-range target, so those fields are deliberately absent. See
- * docs/FIDELITY.md for why the jump could not be reproduced.
+ * docs/TECHNICAL_REPORT.md for why the jump could not be reproduced.
  */
 typedef struct AtomMetadata {
     uint32_t block_idx_lo;   /* first linear block index that does real work  */
@@ -67,6 +67,9 @@ typedef struct LithosKernel {
     uint64_t     enqueue_ns;     /* when the app enqueued this kernel         */
     double       pred_us;        /* predicted duration at the current TPC alloc;
                                   * 0 = unknown, atomizer falls back to a stub */
+    double       atom_cost_us;   /* this operator's LEARNED marginal cost per atom
+                                  * (§5.4 "monitors the effectiveness of the Kernel
+                                  * Atomizer"); 0 = not yet known, use the default */
 } LithosKernel;
 
 /* ------------------------------------------------------------------ */
@@ -85,6 +88,9 @@ typedef struct LithosConfig {
     int      min_blocks_to_atomize; /* skip atomization for tiny grids        */
     int      enable_atomizer;
     int      force_atoms;           /* LITHOS_FORCE_ATOMS: override atom count (0=auto) */
+    int      max_atoms_inflight;    /* LITHOS_ATOMS_INFLIGHT: cap the atoms of one kernel
+                                     * that may be outstanding at once (§5.3, "limits
+                                     * outstanding atoms"). 0 = submit them all at once */
     int      atom_tpc_width;        /* LITHOS_ATOM_TPC: distinct W-TPC slice per atom (0=off) */
     int      atom_tpc_list[64];     /* LITHOS_ATOM_TPC_LIST: per-atom TPC widths (cycled) */
     int      atom_tpc_list_n;       /* number of entries in atom_tpc_list (0=off)        */
@@ -92,7 +98,16 @@ typedef struct LithosConfig {
     int      enable_stealing;
     int      tpc_timers;       /* LITHOS_TPC_TIMERS: per-TPC busy timers gate steals */
     int      predict;             /* LITHOS_PREDICT: online latency prediction (§5.7) */
+    int      predict_bracket;     /* LITHOS_PREDICT_BRACKET: time each launch with its
+                                   * own start+stop pair instead of differencing against
+                                   * the previous completion (see predict.c) */
     int      rightsize;           /* LITHOS_RIGHTSIZE: per-kernel TPC right-sizing (§5.5) */
+    int      rightsize_occ;      /* LITHOS_RIGHTSIZE_OCC: use the stage-1 occupancy bound */
+    int      dvfs;                /* LITHOS_DVFS: transparent power management (§5.6)   */
+    double   dvfs_slip;           /* LITHOS_DVFS_SLIP: latency slip for DVFS (1.1 = 10%) */
+    int      dvfs_min_samples;    /* LITHOS_DVFS_SAMPLES: samples/operator per phase     */
+    double   dvfs_switch_ms;      /* LITHOS_DVFS_SWITCH_MS: min gap between transitions  */
+    double   dvfs_probe_frac;     /* LITHOS_DVFS_PROBE: probe clock as a fraction of f_max */
     double   latency_slip;        /* LITHOS_SLIP: right-sizing latency-slip factor k    */
     int      throttle;            /* LITHOS_THROTTLE: enforce the outstanding-work limit */
     int      dispatch;            /* LITHOS_DISPATCH: buffer launches in launch queues, drained by a

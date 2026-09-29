@@ -70,7 +70,11 @@ uint64_t coord_stealable_tpcs(uint64_t now_ns, uint64_t idle_ns);
 /* Record that `tpc_mask`'s TPCs are expected to be busy until `until_ns`. Called
  * at submission time with the launch's predicted completion. Later deadlines win,
  * so overlapping launches extend rather than shorten a TPC's timer. */
-void coord_mark_tpcs_busy(uint64_t tpc_mask, uint64_t until_ns);
+/* Publish that `dur_ns` of work has been QUEUED on every TPC in `tpc_mask`.
+ * Takes a duration rather than a deadline because the work does not begin when
+ * it is submitted — it begins when whatever is already queued on that TPC has
+ * finished. See the implementation. */
+void coord_mark_tpcs_busy(uint64_t tpc_mask, uint64_t now_ns, uint64_t dur_ns);
 
 /* Mask of TPCs whose timer has not yet expired — those a steal should avoid.
  * Bit t set = TPC t is predicted still busy at now_ns. */

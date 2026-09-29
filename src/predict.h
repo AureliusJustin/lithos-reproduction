@@ -23,6 +23,11 @@ void   predict_reset_op(int slot);
  * `blocks`. Returns 0 if there is no data yet (caller falls back to a default). */
 double predict_lookup(int slot, int op, int tpcs, uint64_t blocks);
 
+/* The marginal cost of one extra atom for this operator, in microseconds, learned
+ * from its split and unsplit measurements. 0 = not known yet, in which case the
+ * caller falls back to the configured constant. See predict_record(). */
+double predict_atom_cost(int slot, int op);
+
 /* Right-sizing (§5.5): minimum TPCs that keeps latency within factor `slip` of the
  * all-TPC latency, using the l = m/t + b model fit from the all-TPC and 1-TPC
  * samples. Returns 0 if the model isn't ready (caller keeps the full allocation).
@@ -37,7 +42,13 @@ int    predict_rightsize(int slot, int op, int all_tpcs, double slip, int* want_
 CUevent predict_evt_get(void);
 /* `start_evt` may be NULL: pass one only when this launch has no in-batch
  * predecessor (the first kernel after a sync), so it can still be timed. */
-void    predict_submit(int slot, int op, int tpcs, CUevent start_evt, CUevent done_evt);
+/* `n_atoms` is how many atoms this launch was split into. It is not bookkeeping:
+ * §5.7 requires the predictor to account for "the granularity at which it is
+ * atomized", because the measured duration of a split launch includes the cost of
+ * the extra relaunches. Feeding that back unadjusted makes the estimate grow, which
+ * splits the kernel further, which grows it again. */
+void    predict_submit(int slot, int op, int tpcs, int n_atoms,
+                       CUevent start_evt, CUevent done_evt);
 
 /* Outstanding work (§5.3): us of in-flight (submitted-not-yet-reaped) work. */
 double  predict_outstanding_us(void);

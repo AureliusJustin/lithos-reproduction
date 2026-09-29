@@ -4,6 +4,7 @@
 #include "predict.h"
 #include "real.h"
 #include "lithos.h"
+#include "power.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -21,6 +22,8 @@ typedef struct {
     int    t_all;          /* the "all-TPC" count used for l_all              */
     double ema;            /* EMA of observed latency (us)                    */
     int    ema_tpc;        /* TPC count the EMA was observed at               */
+    double l_solo;         /* latency when this operator ran UNSPLIT (n=1)    */
+    double atom_cost;      /* observed marginal cost of one extra atom (us)   */
     int    probe_state;    /* 0=need l_all, 1=need l_one, 2=model ready       */
     long   seen;
 } OpPred;
@@ -48,6 +51,7 @@ static pthread_mutex_t g_pmtx = PTHREAD_MUTEX_INITIALIZER;
  * idle gap across the sync. */
 typedef struct {
     int     slot, op, tpcs;
+    int     n_atoms;     /* atoms this launch was split into (>=1) */
     unsigned gen;        /* batch generation this launch belongs to */
     double  predicted_us;/* what we predicted for THIS launch (0 = no prediction) */
     CUevent start_evt;   /* NULL unless this launch had no in-batch predecessor */
@@ -127,6 +131,14 @@ double predict_lookup(int slot, int op, int tpcs, uint64_t blocks) {
     return pred > 0 ? pred : 0;
 }
 
+double predict_atom_cost(int slot, int op) {
+    if (slot < 0 || slot >= P_STREAMS || op < 0 || op >= P_OPS) return 0;
+    pthread_mutex_lock(&g_pmtx);
+    double c = g_tab[slot][op].atom_cost;
+    pthread_mutex_unlock(&g_pmtx);
+    return c;
+}
+
 int predict_rightsize(int slot, int op, int all_tpcs, double slip, int* want_probe) {
     *want_probe = 0;
     if (slot < 0 || slot >= P_STREAMS || op < 0 || op >= P_OPS || all_tpcs < 2) return 0;
@@ -150,11 +162,60 @@ int predict_rightsize(int slot, int op, int all_tpcs, double slip, int* want_pro
     return t_min;
 }
 
-static void predict_record(int slot, int op, int tpcs, double us) {
+/* Record one measurement, normalised to what the kernel would have cost UNSPLIT.
+ *
+ * §5.7: "Each kernel's latency varies based on the allocated TPCs, the GPU
+ * frequency, and the granularity at which it is atomized; therefore, the
+ * prediction module continuously monitors these conditions."
+ *
+ * That last condition is not optional bookkeeping — leaving it out is unstable.
+ * decide_atoms() picks n = predicted_duration / atom_duration, so if the duration
+ * it is given is the duration of an ALREADY-SPLIT launch (which includes the cost
+ * of n-1 extra relaunches), the estimate grows, n grows with it, the next
+ * measurement grows again, and the loop runs away. Measured on a PyTorch training
+ * step before this correction: atom counts reaching 1024 for a kernel that wanted
+ * about 14, and a 15x throughput collapse.
+ *
+ * The correction is the inverse of the cost model decide_atoms already uses:
+ * subtract the (n-1) extra relaunches at atom_cost_us each. Floored at us/n so a
+ * bad cost estimate can never drive the stored duration to zero or negative. */
+static void predict_record(int slot, int op, int tpcs, int n_atoms, double us) {
     if (slot < 0 || slot >= P_STREAMS || op < 0 || op >= P_OPS || us <= 0) return;
     pthread_mutex_lock(&g_pmtx);
     OpPred* o = &g_tab[slot][op];
     o->seen++;
+
+    /* Split launches are measured as a whole, so their duration carries the cost
+     * of the extra relaunches. Two things follow, and both matter.
+     *
+     * LEARN the cost. The marginal cost of an atom is NOT a constant: an
+     * early-exiting block still occupies a block slot with the kernel's full
+     * register and shared-memory demand, so a resource-heavy kernel pays far more
+     * per wasted block than a light one. Measured on this A100: ~2.6 ns per block
+     * for a simple FMA kernel, but ~57 ns for a cuBLAS GEMM — a 930us marginal
+     * cost per atom against the 30us a global constant would assume. So each
+     * operator learns its own, from the gap between its split and unsplit
+     * durations. atomizer.c uses it to bound the split (§5.4, "LithOS continuously
+     * monitors the effectiveness of the Kernel Atomizer").
+     *
+     * NORMALISE the sample. What decide_atoms() needs is the duration the kernel
+     * would have taken UNSPLIT; feeding back the split duration inflates the
+     * estimate, which splits it further, which inflates it again. Measured before
+     * this correction: atom counts reaching 1024 for a kernel that wanted 14. */
+    if (n_atoms > 1) {
+        if (o->l_solo > 0) {
+            double marginal = (us - o->l_solo) / (n_atoms - 1);
+            if (marginal > 0)
+                o->atom_cost = o->atom_cost > 0 ? 0.7 * o->atom_cost + 0.3 * marginal
+                                                : marginal;
+        }
+        double cost = o->atom_cost > 0 ? o->atom_cost : g_lithos_cfg.atom_cost_us;
+        double norm = us - (n_atoms - 1) * cost;
+        double floor_us = us / n_atoms;
+        us = norm > floor_us ? norm : floor_us;
+    } else {
+        o->l_solo = o->l_solo > 0 ? 0.7 * o->l_solo + 0.3 * us : us;
+    }
     o->ema = o->ema > 0 ? 0.7 * o->ema + 0.3 * us : us;
     o->ema_tpc = tpcs;
     /* fill the scaling-model points as the right-sizer probes them */
@@ -163,6 +224,9 @@ static void predict_record(int slot, int op, int tpcs, double us) {
     else if (o->probe_state == 1 && o->t_all && tpcs == o->t_all) o->l_all = 0.7*o->l_all + 0.3*us;
     double ema = o->ema; long seen = o->seen;
     pthread_mutex_unlock(&g_pmtx);
+    /* §5.6 learns from the same measurements: an operator's latency at the
+     * current clock is what yields its frequency sensitivity. */
+    power_note_measure(slot, op, us);
     if (getenv("LITHOS_LOG_PREDICT"))
         fprintf(stderr, "[predict] op(slot=%d,k=%d) @%dTPC measured=%.1fus ema=%.1fus seen=%ld\n",
                 slot, op, tpcs, us, ema, seen);
@@ -230,7 +294,7 @@ static void evt_put(CUevent e) {
 
 /* Queue one launch's completion event for the Tracker. `done_evt` must already
  * have been recorded on the launch stream AFTER the launch. */
-void predict_submit(int slot, int op, int tpcs, CUevent start_evt, CUevent done_evt) {
+void predict_submit(int slot, int op, int tpcs, int n_atoms, CUevent start_evt, CUevent done_evt) {
     if (!done_evt) { evt_put(start_evt); return; }
     /* Credit the estimated work immediately so the throttle sees this launch as
      * in flight right away; the estimate is corrected when the event is reaped. */
@@ -246,7 +310,8 @@ void predict_submit(int slot, int op, int tpcs, CUevent start_evt, CUevent done_
     }
     unsigned gen = (slot >= 0 && slot < P_STREAMS)
                  ? __atomic_load_n(&g_batch_gen[slot], __ATOMIC_RELAXED) : 0;
-    g_pend[g_pend_head] = (Pend){ slot, op, tpcs, gen, est_at_submit, start_evt, done_evt, 1 };
+    g_pend[g_pend_head] = (Pend){ slot, op, tpcs, n_atoms < 1 ? 1 : n_atoms,
+                                  gen, est_at_submit, start_evt, done_evt, 1 };
     g_pend_head = next;
     pthread_mutex_unlock(&g_pendmtx);
 
@@ -300,7 +365,7 @@ static int reap_one(void) {
             if (p.predicted_us > 0 && getenv("LITHOS_PREDICT_ACC"))
                 fprintf(stderr, "[acc] slot=%d op=%d tpc=%d pred=%.1f actual=%.1f err=%.1f\n",
                         p.slot, p.op, p.tpcs, p.predicted_us, actual_us, p.predicted_us - actual_us);
-            predict_record(p.slot, p.op, p.tpcs, actual_us);
+            predict_record(p.slot, p.op, p.tpcs, p.n_atoms, actual_us);
             scored = 1;
         }
         evt_put(p.start_evt);
@@ -321,7 +386,7 @@ static int reap_one(void) {
                     fprintf(stderr, "[acc] slot=%d op=%d tpc=%d pred=%.1f actual=%.1f err=%.1f\n",
                             p.slot, p.op, p.tpcs, p.predicted_us, actual_us,
                             p.predicted_us - actual_us);
-                predict_record(p.slot, p.op, p.tpcs, actual_us);
+                predict_record(p.slot, p.op, p.tpcs, p.n_atoms, actual_us);
             }
         }
         evt_put(g_prev_evt[p.slot]);         /* recycle the old reference */
@@ -363,6 +428,10 @@ static void* tracker_main(void* arg) {
     for (;;) {
         int did = 0;
         while (reap_one()) did = 1;
+        /* The Tracker is where §5.6's decision belongs: it is the thread that
+         * already sees every completion, and a frequency change must not sit on
+         * the application's launch path. power_maybe_update rate-limits itself. */
+        power_maybe_update();
         if (!did) usleep(50);       /* idle nap; keeps reap latency low */
     }
     return NULL;

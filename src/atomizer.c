@@ -73,6 +73,14 @@ int atomize_image_to_cubin(const void* image, int want_sm, void** out, size_t* o
 static CUdeviceptr     g_meta;            /* device AtomMetadata{lo,hi}            */
 static CUevent         g_atom_ev;         /* orders g_meta writes across streams   */
 static int             g_atom_ev_valid;   /* has g_atom_ev been recorded yet?      */
+
+/* Bounded atom pipeline (§5.3: LithOS "limits outstanding atoms"). One event per
+ * in-flight slot; atom i waits on the event of atom i-width before it is even
+ * *scheduled*, which is what lets the allocation react mid-kernel. See
+ * atom_gate_width(). */
+#define ATOM_RING_MAX 64
+static CUevent         g_atom_ring[ATOM_RING_MAX];
+static int             g_atom_ring_n;     /* events created so far                 */
 static unsigned char*  g_prologue;        /* the range-check SASS bytes (padded)   */
 static size_t          g_prolen;          /* its length                            */
 static int             g_prologue_ready;  /* prologue + g_meta built?              */
@@ -82,7 +90,9 @@ static pthread_mutex_t g_mtx = PTHREAD_MUTEX_INITIALIZER;   /* guards all of the
 /* The Ex launch path has no LithosKernel to carry pred_us, so sched.c stashes the
  * predicted duration here (per thread) just before calling atomizer_dispatch_ex. */
 static __thread double g_ex_pred_us = 0;
+static __thread double g_ex_atom_cost = 0;
 void atomizer_set_ex_pred(double us) { g_ex_pred_us = us; }
+void atomizer_set_ex_atom_cost(double us) { g_ex_atom_cost = us; }
 
 /* sched.c already has to know whether the stream is capturing, and
  * cuStreamIsCapturing is a driver call — so it passes the answer down here rather
@@ -392,7 +402,7 @@ void atomizer_note_library_module(CUmodule m, CUlibrary lib) {
     pthread_mutex_unlock(&g_mtx);
 }
 /* Why a kernel ended up in the class it did. Coverage is the headline number in
- * docs/BENCHMARKS.md, and when a closed-source library reports 0% the question is
+ * docs/TECHNICAL_REPORT.md, and when a closed-source library reports 0% the question is
  * always the same: did we never see the module, or did we see it and skip the
  * kernel? This answers it by name. */
 static void diag_class(const char* api, const char* name, int have_container, int gated) {
@@ -485,7 +495,7 @@ static int is_full_func(CUfunction f) {
     return g_full_set && fset_has(g_full_set, (void*)f);
 }
 
-/* Number of atoms = ceil(predicted_duration / atom_duration), clamped to
+/* Number of atoms = floor(predicted_duration / atom_duration), clamped to
  * [1, blocks] (§5.4). `pred_us` is the online predictor's estimate (§5.7) when
  * available; otherwise we fall back to the `blocks x 0.5us` stub. For very large
  * grids the atom_duration is scaled up to bound early-exit thread-block traffic
@@ -506,23 +516,33 @@ static int is_full_func(CUfunction f) {
  *
  *  CEILING — from the latency budget. A co-located latency-critical tenant waits
  *     behind at most ONE atom of this kernel (measured: HP tail latency tracked
- *     atom size almost exactly, see docs/BENCHMARKS.md §4), so if this process
+ *     atom size almost exactly, see docs/TECHNICAL_REPORT.md), so if this process
  *     must not delay others by more than LITHOS_SLO_US, atoms must not exceed it.
  *     The paper has no equivalent: its fixed 250-500us is unrelated to any SLO.
  *
  * Plus the paper's own aggressiveness control: very large grids get a longer atom
  * duration, to bound the extra thread-block traffic from early-exiting blocks. */
-static double effective_atom_us(uint64_t blocks) {
+static double effective_atom_us(uint64_t blocks, double learned_cost_us) {
     double atom_us = g_lithos_cfg.atom_duration_us;
 
     /* Paper: "for kernels with a large number of thread blocks, the Kernel
      * Atomizer dynamically adjusts the atom_duration parameter." */
     if (blocks > 4096) atom_us *= 2.0;
 
-    /* FLOOR: keep splitting overhead under max_overhead of the kernel's runtime. */
+    /* FLOOR: keep splitting overhead under max_overhead of the kernel's runtime.
+     *
+     * The cost of an extra atom is per-KERNEL, not global. An early-exiting block
+     * still takes a block slot at the kernel's own register and shared-memory
+     * footprint, so a cuBLAS GEMM pays two orders of magnitude more per wasted
+     * block than a simple elementwise kernel (measured: ~930us vs ~30us per atom
+     * on this A100). A single configured constant therefore cannot bound the
+     * overhead across a real workload — it either over-splits the heavy kernels or
+     * refuses to split the light ones. So prefer the cost this operator has
+     * actually demonstrated, and fall back to the constant only until it has. */
+    double cost = learned_cost_us > 0.0 ? learned_cost_us : g_lithos_cfg.atom_cost_us;
     double frac = g_lithos_cfg.atom_max_overhead;
-    if (frac > 0.0 && g_lithos_cfg.atom_cost_us > 0.0) {
-        double floor_us = g_lithos_cfg.atom_cost_us / frac;
+    if (frac > 0.0 && cost > 0.0) {
+        double floor_us = cost / frac;
         if (atom_us < floor_us) atom_us = floor_us;
     }
 
@@ -533,7 +553,7 @@ static double effective_atom_us(uint64_t blocks) {
     return atom_us > 1.0 ? atom_us : 1.0;
 }
 
-static int decide_atoms(uint64_t blocks, double pred_us) {
+static int decide_atoms(uint64_t blocks, double pred_us, double learned_cost_us) {
     if (!g_lithos_cfg.enable_atomizer) return 1;
     if (g_lithos_cfg.graph_subgraphs > 1) return 1;  /* graphs: subgraph is the unit, kernels run whole */
     if (g_lithos_cfg.force_atoms > 0) {   /* explicit override (testing/policy) */
@@ -542,15 +562,28 @@ static int decide_atoms(uint64_t blocks, double pred_us) {
     }
     if (blocks < (uint64_t)g_lithos_cfg.min_blocks_to_atomize) return 1;
 
-    double atom_us = effective_atom_us(blocks);
-    double dur = (pred_us > 0) ? pred_us : (double)blocks * 0.5;   /* predictor, or stub */
+    /* No prediction yet: run the kernel WHOLE.
+     *
+     * §5.4 splits "when a long-running kernel is about to be scheduled" using a
+     * duration "predict[ed] ... using the predictor module" — so a kernel nobody
+     * has measured is not a candidate. The old fallback guessed blocks x 0.5us,
+     * and guessing here is worse than not splitting for two reasons: the guess is
+     * unrelated to the kernel's real cost, and splitting on the very first launch
+     * means the operator NEVER runs unsplit, so neither its true duration nor its
+     * marginal atom cost can ever be measured. That is what let the estimate feed
+     * back on itself: measured 1024-way splits of a kernel that wanted none. One
+     * unsplit launch per operator is all it takes to ground both. */
+    if (pred_us <= 0) return 1;
+
+    double atom_us = effective_atom_us(blocks, learned_cost_us);
+    double dur = pred_us;
     int n = (int)(dur / atom_us);
     if (n < 1) n = 1;
     if ((uint64_t)n > blocks) n = (int)blocks;
     return n;
 }
 int atomizer_num_atoms(const LithosKernel* k, double pred_us) {
-    return decide_atoms(k->total_blocks, pred_us);
+    return decide_atoms(k->total_blocks, pred_us, k->atom_cost_us);
 }
 
 /* Write {lo,hi} to the shared metadata address, ordered on the launch stream
@@ -635,6 +668,48 @@ static void atom_serial_end_ex(CUstream s, int capturing, int skip) {
     if (!capturing && !skip && g_atom_ev) { cuEventRecord(g_atom_ev, s); g_atom_ev_valid = 1; }
 }
 
+/* ---- Bounded atom pipeline (§5.3, "limits outstanding atoms") --------------
+ *
+ * Without this, the atom loop enqueues all N launches back to back: the host
+ * finishes submitting long before atom 0 has run, so every atom's TPC mask is
+ * decided inside the same few microseconds. That makes the paper's Figure 10(c)
+ * unreachable — "stealing is disabled for the latter's subsequent atoms once
+ * request [a] is submitted" needs the *later* atoms to be scheduled after the
+ * arrival they are supposed to react to.
+ *
+ * With `LITHOS_ATOMS_INFLIGHT=W`, at most W atoms of a kernel are outstanding:
+ * before submitting atom i we block until atom i-W has completed, and only then
+ * compute atom i's mask. So the allocation is re-decided W atoms ahead of
+ * execution rather than N, and a tenant that arrives mid-kernel is seen.
+ *
+ * Cost is real and is why this is opt-in: the submitting thread now waits on the
+ * GPU inside the atom loop, holding g_mtx (which already serialises atomized
+ * launches process-wide, so this lengthens an existing critical section rather
+ * than creating one). W=0 keeps the original fire-everything behaviour.
+ *
+ * Returns the effective width, or 0 for "no gate". Caller holds g_mtx. */
+static int atom_gate_width(int n_atoms, int capturing) {
+    int w = g_lithos_cfg.max_atoms_inflight;
+    if (w <= 0 || capturing || n_atoms <= w) return 0;   /* nothing to bound */
+    if (w > ATOM_RING_MAX) w = ATOM_RING_MAX;
+    while (g_atom_ring_n < w) {
+        if (cuEventCreate(&g_atom_ring[g_atom_ring_n], CU_EVENT_DISABLE_TIMING)
+                != CUDA_SUCCESS)
+            return g_atom_ring_n;                        /* use what we managed */
+        g_atom_ring_n++;
+    }
+    return w;
+}
+
+/* Wait until fewer than `w` atoms are in flight, i.e. until atom i-w is done.
+ * A no-op for the first w atoms, which have nothing to wait behind. */
+static void atom_gate_wait(int w, int i) {
+    if (w > 0 && i >= w) cuEventSynchronize(g_atom_ring[i % w]);
+}
+static void atom_gate_mark(int w, int i, CUstream s) {
+    if (w > 0) cuEventRecord(g_atom_ring[i % w], s);
+}
+
 static int launch_original(LithosKernel* k) {
     g_real.cuLaunchKernel((CUfunction)k->func,
                           k->gridDimX, k->gridDimY, k->gridDimZ,
@@ -681,7 +756,7 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
     }
 
     /* --- class ATOM: split the grid ---------------------------------------- */
-    int      n_atoms       = decide_atoms(blocks, k->pred_us);
+    int      n_atoms       = decide_atoms(blocks, k->pred_us, k->atom_cost_us);
     uint64_t blocks_per_atom = (blocks + n_atoms - 1) / n_atoms;   /* ceil-divide */
     int      launched      = 0;
 
@@ -692,6 +767,7 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
      * (serial_can_skip); it is also skipped during graph capture. */
     int capturing = stream_capturing(s);
     int skip = !capturing && serial_can_skip(s);
+    int gate = atom_gate_width(n_atoms, capturing);
     atom_serial_begin_ex(s, capturing, skip);
 
     for (int i = 0; i < n_atoms; i++) {
@@ -699,6 +775,11 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
         uint64_t hi = lo + blocks_per_atom;
         if (hi > blocks) hi = blocks;
         if (lo >= hi) break;                     /* ragged tail: no blocks left */
+
+        /* Bound the atoms in flight (§5.3) BEFORE deciding this atom's
+         * allocation, so the decision below sees the state of the world as of
+         * now rather than as of the start of the kernel. */
+        atom_gate_wait(gate, i);
 
         /* Publish this atom's range, stream-ordered ahead of its launch. */
         meta_write_cached(s, (uint32_t)lo, (uint32_t)hi, skip && !capturing);
@@ -709,6 +790,7 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
         lithos_apply_atom_mask(s, i, n_atoms);
 
         launch_original(k);
+        atom_gate_mark(gate, i, s);
         launched++;
     }
     if (launched == 0) { launch_original(k); launched = 1; }   /* safety net */
@@ -736,13 +818,14 @@ int atomizer_dispatch_ex(const CUlaunchConfig* cfg, CUfunction f, void** params,
     for (unsigned i = 0; i < cfg->numAttrs; i++)
         if (cfg->attrs[i].id == CU_LAUNCH_ATTRIBUTE_COOPERATIVE ||
             cfg->attrs[i].id == CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION) { nosplit = 1; break; }
-    int n = nosplit ? 1 : decide_atoms(blocks, g_ex_pred_us);
+    int n = nosplit ? 1 : decide_atoms(blocks, g_ex_pred_us, g_ex_atom_cost);
     uint64_t per = (blocks + n - 1) / n;
     int launched = 0;
     pthread_mutex_lock(&g_mtx);
     int cap  = stream_capturing(s);
     int skip = !cap && serial_can_skip(s);
     int cacheable = skip && !cap;
+    int gate = atom_gate_width(n, cap);
     atom_serial_begin_ex(s, cap, skip);
     if (n <= 1) {
         meta_write_cached(s, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks), cacheable);
@@ -750,8 +833,16 @@ int atomizer_dispatch_ex(const CUlaunchConfig* cfg, CUfunction f, void** params,
     } else for (int i = 0; i < n; i++) {
         uint64_t lo = (uint64_t)i * per, hi = lo + per; if (hi > blocks) hi = blocks;
         if (lo >= hi) break;
+        atom_gate_wait(gate, i);
         meta_write_cached(s, (uint32_t)lo, (uint32_t)hi, cacheable);
+        /* Re-arm the one-shot TPC mask for EVERY atom, exactly as the
+         * cuLaunchKernel path does. Without this only atom 0 carried the
+         * scheduler's allocation and atoms 1..n-1 uploaded unmasked — i.e. they
+         * ran on the whole device, escaping the tenant's quota. The CUDA runtime
+         * launches through this entry point, so that reached frameworks. */
+        lithos_apply_atom_mask(s, i, n);
         g_real.cuLaunchKernelEx(cfg, f, params, extra);
+        atom_gate_mark(gate, i, s);
         launched++;
     }
     atom_serial_end_ex(s, cap, skip);

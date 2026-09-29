@@ -34,6 +34,7 @@
 #include "atomizer.h"
 #include "qmd.h"
 #include "predict.h"
+#include "power.h"
 #include "coord.h"
 #include <cuda.h>
 #include <stdio.h>
@@ -73,6 +74,10 @@ static void predict_ensure(void) {
     if (g_predict_ready) return;
     predict_init();
     predict_start_tracker();
+    /* §5.6 rides on the predictor's measurements and on the Tracker thread, so it
+     * comes up with them — and here rather than at library load, because
+     * enumerating clocks needs a device. */
+    power_init();
     g_predict_ready = 1;
 }
 
@@ -246,6 +251,7 @@ CUresult submit_launch_now(CUfunction f,
 
         /* Predicted duration at the effective allocation drives the atom count. */
         k.pred_us = predict_lookup(slot, op, eff_tpc, k.total_blocks);
+        k.atom_cost_us = predict_atom_cost(slot, op);   /* §5.4 effectiveness monitor */
 
         /* Per-TPC timers (§5.3), "estimating kernel (and atom) durations at
          * submission time": now that both the final TPC set and the predicted
@@ -260,7 +266,8 @@ CUresult submit_launch_now(CUfunction f,
         measure = !capturing;
         /* The first kernel of a batch has no previous completion to difference
          * against, so give it its own start event; otherwise one event suffices. */
-        if (measure && op == 0 && (ev_start = predict_evt_get()))
+        if (measure && (op == 0 || g_lithos_cfg.predict_bracket)
+                && (ev_start = predict_evt_get()))
             cuEventRecord(ev_start, stream);
     }
 
@@ -271,7 +278,7 @@ CUresult submit_launch_now(CUfunction f,
      * the duration from the gap to the previous completion on this queue. */
     if (measure && (ev_done = predict_evt_get())) {
         cuEventRecord(ev_done, stream);
-        predict_submit(slot, op, eff_tpc, ev_start, ev_done);
+        predict_submit(slot, op, eff_tpc, n_atoms, ev_start, ev_done);
     }
 
     postsubmit(stream, n_atoms);
@@ -327,14 +334,17 @@ CUresult submit_launch_ex_now(const CUlaunchConfig* cfg, CUfunction f,
          * the atomizer on this thread. */
         double pred_us = predict_lookup(slot, op, tpcs, blocks);
         atomizer_set_ex_pred(pred_us);
+        atomizer_set_ex_atom_cost(predict_atom_cost(slot, op));
         /* Per-TPC timers (§5.3) — same as the standard path. */
         tpc_mark_busy(cur_mask, pred_us, lithos_now_ns());
         if (!on_dispatcher) throttle_wait();
         measure = !capturing;
-        if (measure && op == 0 && (ev_start = predict_evt_get()))
+        if (measure && (op == 0 || g_lithos_cfg.predict_bracket)
+                && (ev_start = predict_evt_get()))
             cuEventRecord(ev_start, cfg->hStream);
     } else {
         atomizer_set_ex_pred(0);
+        atomizer_set_ex_atom_cost(0);
     }
 
     int n_atoms = atomizer_dispatch_ex(cfg, f, params, extra);
@@ -343,7 +353,7 @@ CUresult submit_launch_ex_now(const CUlaunchConfig* cfg, CUfunction f,
      * previous completion on this queue (see predict.c). */
     if (measure && (ev_done = predict_evt_get())) {
         cuEventRecord(ev_done, cfg->hStream);
-        predict_submit(slot, op, tpcs, ev_start, ev_done);
+        predict_submit(slot, op, tpcs, n_atoms, ev_start, ev_done);
     }
 
     postsubmit(cfg->hStream, n_atoms);
