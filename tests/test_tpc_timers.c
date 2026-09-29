@@ -97,7 +97,7 @@ int main(void) {
      * B's occupied TPCs it co-schedules into their free warp slots instead of
      * queueing, and both configurations complete in ~0.03 ms. Timing was measured
      * and deliberately dropped rather than reported as a benefit it does not show
-     * (see docs/FINDINGS.md). */
+     * (see docs/TECHNICAL_REPORT.md). */
     CK(cuLaunchKernel(probe, G,1,1, 32,1,1, 0, A, probe_args, 0));
     CK(cuStreamSynchronize(A));
     CK(cuStreamSynchronize(B));
