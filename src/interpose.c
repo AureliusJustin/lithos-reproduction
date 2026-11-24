@@ -16,6 +16,7 @@
  *       wrappers for the calls we override and the real pointer otherwise.
  */
 #define _GNU_SOURCE
+#include "gate.h"            /* external admission gate (arbiter) */
 #include <cuda.h>
 #include <stdio.h>
 #include <string.h>
@@ -359,6 +360,7 @@ CUresult cuGraphLaunch(CUgraphExec exec, CUstream stream) {
     /* A graph launch is ordinary stream-ordered work: it must not overtake
      * kernels still sitting in this stream's launch queue. */
     if (dispatch_pending()) dispatch_drain(stream);
+    lithos_gate_wait();                       /* external admission gate: a graph launch is aggressor work too */
     if (lithos_graph_launch(exec, stream)) return CUDA_SUCCESS;
     return rg_launch(exec, stream);
 }

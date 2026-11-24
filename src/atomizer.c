@@ -30,6 +30,7 @@
  *     so every block of atom_i observes meta_i before atom_{i+1} overwrites it.
  */
 #define _GNU_SOURCE
+#include "gate.h"            /* external admission gate (arbiter); no-op unless LITHOS_GATE is set */
 #include <cuda.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -737,6 +738,7 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
     if (!is_atomized_func(f)) {
         if (!is_full_func(f)) {                 /* VERBATIM: not ours, pass through */
             stat_verbatim(f);
+            if (lithos_gate_enabled() && !stream_capturing(s)) lithos_gate_wait();
             return launch_original(k);
         }
         /* FULL: may carry a prologue but isn't individually gated, so pin the range
@@ -747,6 +749,7 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
         atom_serial_begin_ex(s, capturing, skip);
         meta_write_cached(s, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks),
                           skip && !capturing);
+        if (!capturing) lithos_gate_wait();
         launch_original(k);
         atom_serial_end_ex(s, capturing, skip);
         pthread_mutex_unlock(&g_mtx);
@@ -780,6 +783,9 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
          * allocation, so the decision below sees the state of the world as of
          * now rather than as of the start of the kernel. */
         atom_gate_wait(gate, i);
+        /* External admission gate: hold this atom while the arbiter says the co-located latency-critical tenant
+         * cannot absorb it (no-op unless LITHOS_GATE is set). */
+        if (!capturing) lithos_gate_wait();
 
         /* Publish this atom's range, stream-ordered ahead of its launch. */
         meta_write_cached(s, (uint32_t)lo, (uint32_t)hi, skip && !capturing);
@@ -808,7 +814,11 @@ int atomizer_dispatch(LithosKernel* k, int quota_tpcs) {
  * attributes such as clusters). */
 int atomizer_dispatch_ex(const CUlaunchConfig* cfg, CUfunction f, void** params, void** extra) {
     int atom = is_atomized_func(f), full = !atom && is_full_func(f);
-    if (!atom && !full) { stat_verbatim((void*)f); return (g_real.cuLaunchKernelEx(cfg, f, params, extra), 1); }
+    if (!atom && !full) {
+        stat_verbatim((void*)f);
+        if (lithos_gate_enabled() && !stream_capturing(cfg->hStream)) lithos_gate_wait();
+        return (g_real.cuLaunchKernelEx(cfg, f, params, extra), 1);
+    }
     uint64_t blocks = (uint64_t)cfg->gridDimX * cfg->gridDimY * cfg->gridDimZ;
     CUstream s = cfg->hStream;
     /* Cooperative / cluster launches must NOT be split: a grid- or cluster-wide
@@ -829,11 +839,13 @@ int atomizer_dispatch_ex(const CUlaunchConfig* cfg, CUfunction f, void** params,
     atom_serial_begin_ex(s, cap, skip);
     if (n <= 1) {
         meta_write_cached(s, 0, (uint32_t)(blocks > 0xffffffffu ? 0xffffffffu : blocks), cacheable);
+        if (!cap) lithos_gate_wait();
         g_real.cuLaunchKernelEx(cfg, f, params, extra); launched = 1;
     } else for (int i = 0; i < n; i++) {
         uint64_t lo = (uint64_t)i * per, hi = lo + per; if (hi > blocks) hi = blocks;
         if (lo >= hi) break;
         atom_gate_wait(gate, i);
+        if (!cap) lithos_gate_wait();                 /* external admission gate (see the cuLaunchKernel path) */
         meta_write_cached(s, (uint32_t)lo, (uint32_t)hi, cacheable);
         /* Re-arm the one-shot TPC mask for EVERY atom, exactly as the
          * cuLaunchKernel path does. Without this only atom 0 carried the

@@ -4,7 +4,10 @@ CC     ?= gcc
 CXX    ?= g++
 ARCH   ?= native          # auto-detect the installed GPU (A6000=sm_86, A100=sm_80, ...)
 
-CFLAGS  := -Wall -Wno-parentheses -fPIC -O2 -g -Isrc -I$(CUDA)/include
+# Optimisation: -O3 and the build host's ISA (the library is always built on the node that runs it). Override with
+# `make OPT=-O2` for the previous flags. -g costs nothing at run time; assertions are kept.
+OPT     ?= -O3 -march=native
+CFLAGS  := -Wall -Wno-parentheses -fPIC $(OPT) -g -Isrc -I$(CUDA)/include
 LDFLAGS := -ldl -lpthread -lrt -L$(CUDA)/lib64 -lcuda -l:libzstd.so.1
 
 BUILD := build
@@ -23,7 +26,7 @@ all: $(BUILD)/liblithos_full.so $(BUILD)/libcuda.so.1 tests
 FULL_SRC := src/interpose.c src/real.c src/config.c src/barrier.c src/params.c \
             src/sched.c src/sched_stream.c src/tpc_alloc.c src/dispatch.c \
             src/atomizer.c src/atomize_splice.c src/fatbin.c src/qmd.c \
-            src/graphsched.c src/predict.c src/coord.c src/power.c
+            src/graphsched.c src/predict.c src/coord.c src/power.c src/gate.c
 
 # liblithos_full.so: LD_PRELOAD in front of a driver-API app.
 $(BUILD)/liblithos_full.so: $(FULL_SRC) src/*.h | $(BUILD)
@@ -130,8 +133,14 @@ $(BUILD)/kernels/%.cubin: bench/kernels/%.cu | $(BUILD)/kernels
 $(BUILD)/%: bench/%.c | $(BUILD)
 	$(CC) -O2 $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda -lpthread
 
+# Host-only test of the external admission gate (src/gate.c): no GPU, no CUDA.
+.PHONY: test_gate
+test_gate: | $(BUILD)
+	$(CC) $(OPT) -Wall -pthread tests/test_gate.c src/gate.c -o $(BUILD)/test_gate
+	$(BUILD)/test_gate
+
 .PHONY: run_tests
-run_tests: all
+run_tests: all test_gate
 	@echo "== interposition (driver API / LD_PRELOAD) =="
 	LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_interpose_driver
 	@echo "== interposition (CUDA runtime / wrapper) =="
