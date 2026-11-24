@@ -262,7 +262,9 @@ CUresult submit_launch_now(CUfunction f,
 
         /* (5) Throttle before submitting — unless the dispatcher already did it
          * on our behalf, before it chose this launch. */
-        if (!on_dispatcher) throttle_wait();
+        /* Not while capturing: a captured launch does not run, so outstanding work cannot drain and every launch would
+         * sit out the throttle's ~100 ms cap (vLLM 0.26's graph capture took minutes per graph with LITHOS_THROTTLE=1). */
+        if (!on_dispatcher && !capturing) throttle_wait();
         measure = !capturing;
         /* The first kernel of a batch has no previous completion to difference
          * against, so give it its own start event; otherwise one event suffices. */
@@ -337,7 +339,9 @@ CUresult submit_launch_ex_now(const CUlaunchConfig* cfg, CUfunction f,
         atomizer_set_ex_atom_cost(predict_atom_cost(slot, op));
         /* Per-TPC timers (§5.3) — same as the standard path. */
         tpc_mark_busy(cur_mask, pred_us, lithos_now_ns());
-        if (!on_dispatcher) throttle_wait();
+        /* Not while capturing: a captured launch does not run, so outstanding work cannot drain and every launch would
+         * sit out the throttle's ~100 ms cap (vLLM 0.26's graph capture took minutes per graph with LITHOS_THROTTLE=1). */
+        if (!on_dispatcher && !capturing) throttle_wait();
         measure = !capturing;
         if (measure && (op == 0 || g_lithos_cfg.predict_bracket)
                 && (ev_start = predict_evt_get()))
@@ -384,8 +388,9 @@ CUresult submit_launch_coop_now(CUfunction f,
                                 void** params, int on_dispatcher) {
     lithos_internal_begin();                 /* see submit_launch_now */
     (void)presubmit(stream, NULL, NULL, 1, NULL);
-    if (!on_dispatcher) throttle_wait();
-    atomizer_set_capture_hint(stream_capturing(stream));
+    int capturing = stream_capturing(stream);
+    if (!on_dispatcher && !capturing) throttle_wait();   /* not while capturing (see submit_launch_now) */
+    atomizer_set_capture_hint(capturing);
     int n_atoms = atomizer_dispatch_coop(f, gx, gy, gz, bx, by, bz, shmem, stream, params);
     postsubmit(stream, n_atoms);
     lithos_internal_end();
