@@ -94,13 +94,15 @@ fi
 
 # ---- 4. the device is restored -------------------------------------------
 sleep 1
+# "Restored" = the board's DEFAULT application clock, not its max: on some boards the two differ (RTX A6000 on driver 570:
+# default 1800 MHz, max 2100 MHz), and comparing against the max reported a restored GPU as pinned.
 cur_max=$(nvidia-smi --query-gpu=clocks.max.gr --format=csv,noheader | awk '{print $1}')
-if nvidia-smi -q -d PERFORMANCE 2>/dev/null | grep -qi "SW Thermal Slowdown\|Not Active" || true; then :; fi
+dflt=$(nvidia-smi --query-gpu=clocks.default_applications.gr --format=csv,noheader | awk '{print $1}')
 applied_now=$(nvidia-smi --query-gpu=clocks.applications.gr --format=csv,noheader | awk '{print $1}')
-if [[ "$applied_now" == "$cur_max" ]]; then
-    echo "  PASS: GPU clocks restored on exit ($applied_now MHz)"
+if [[ "$applied_now" == "$dflt" ]]; then
+    echo "  PASS: GPU clocks restored on exit ($applied_now MHz = default; max $cur_max)"
 else
-    echo "  FAIL: GPU left pinned ($applied_now MHz, max $cur_max) — run: sudo nvidia-smi -rgc"; fail=1
+    echo "  FAIL: GPU left pinned ($applied_now MHz, default $dflt, max $cur_max) — run: sudo nvidia-smi -rgc"; fail=1
 fi
 
 if [[ $fail -eq 0 ]]; then echo "DVFS: PASS (0 failures)"; else echo "DVFS: FAIL"; fi
