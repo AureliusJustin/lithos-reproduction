@@ -54,6 +54,8 @@ typedef struct {
     int     n_atoms;     /* atoms this launch was split into (>=1) */
     unsigned gen;        /* batch generation this launch belongs to */
     double  predicted_us;/* what we predicted for THIS launch (0 = no prediction) */
+    double  credit_us;   /* added to the outstanding count at submit; removed exactly at reap */
+    int     learn;       /* 0: release the credit and events but record no duration */
     CUevent start_evt;   /* NULL unless this launch had no in-batch predecessor */
     CUevent done_evt;
     int     used;
@@ -98,7 +100,13 @@ void predict_init(void) {
 int predict_next_op(int slot) {
     if (slot < 0 || slot >= P_STREAMS) return 0;
     int k = g_op_idx[slot];
-    if (k >= P_OPS - 1) k = P_OPS - 1;         /* clamp; long batches share the last slot */
+    /* Past the table, the launch is untracked (-1: no prediction, no sample),
+     * as when the predictor is off. It used to share the last slot: a batch with
+     * thousands of distinct kernels and no sync (SGLang's piecewise CUDA-graph
+     * warm-up and capture) then pooled every one of them into a single estimate,
+     * the atomizer split even tiny kernels by that estimate, and each captured
+     * graph grew: capture slowed from ~7 s to ~150 s per graph. */
+    if (k >= P_OPS) return -1;
     g_op_idx[slot] = k + 1;
     return k;
 }
@@ -294,7 +302,7 @@ static void evt_put(CUevent e) {
 
 /* Queue one launch's completion event for the Tracker. `done_evt` must already
  * have been recorded on the launch stream AFTER the launch. */
-void predict_submit(int slot, int op, int tpcs, int n_atoms, CUevent start_evt, CUevent done_evt) {
+void predict_submit(int slot, int op, int tpcs, int n_atoms, CUevent start_evt, CUevent done_evt, int learn) {
     if (!done_evt) { evt_put(start_evt); return; }
     /* Credit the estimated work immediately so the throttle sees this launch as
      * in flight right away; the estimate is corrected when the event is reaped. */
@@ -311,7 +319,7 @@ void predict_submit(int slot, int op, int tpcs, int n_atoms, CUevent start_evt, 
     unsigned gen = (slot >= 0 && slot < P_STREAMS)
                  ? __atomic_load_n(&g_batch_gen[slot], __ATOMIC_RELAXED) : 0;
     g_pend[g_pend_head] = (Pend){ slot, op, tpcs, n_atoms < 1 ? 1 : n_atoms,
-                                  gen, est_at_submit, start_evt, done_evt, 1 };
+                                  gen, est_at_submit, est, learn, start_evt, done_evt, 1 };
     g_pend_head = next;
     pthread_mutex_unlock(&g_pendmtx);
 
@@ -358,7 +366,7 @@ static int reap_one(void) {
      * launch (latency-critical inference) would never be measured at all — every
      * launch is the first of its batch, so there is no previous completion to
      * difference against. */
-    if (p.start_evt) {
+    if (p.start_evt && p.learn) {
         float ms = 0;
         if (cuEventElapsedTime(&ms, p.start_evt, p.done_evt) == CUDA_SUCCESS && ms >= 0) {
             double actual_us = ms * 1000.0;
@@ -371,10 +379,11 @@ static int reap_one(void) {
         evt_put(p.start_evt);
     }
 
+    if (p.start_evt && !p.learn) evt_put(p.start_evt);
     if (!scored && valid_slot && g_prev_valid[p.slot]) {
         /* Only difference against the previous completion if it belongs to the
          * SAME batch — otherwise the gap spans a sync and is idle time. */
-        if (g_prev_gen[p.slot] == p.gen) {
+        if (g_prev_gen[p.slot] == p.gen && p.learn) {
             float ms = 0;
             if (cuEventElapsedTime(&ms, g_prev_evt[p.slot], p.done_evt) == CUDA_SUCCESS && ms >= 0) {
                 double actual_us = ms * 1000.0;
@@ -400,9 +409,13 @@ static int reap_one(void) {
     }
     track_leave();   /* done with CUDA; a waiting capture may now proceed */
 
-    /* Release this launch's share of the outstanding-work counter (§5.3). */
-    double est = predict_lookup(p.slot, p.op, p.tpcs, 0);
-    if (est <= 0) est = 20.0;
+    /* Release this launch's share of the outstanding-work counter (§5.3): exactly
+     * what submit added. Re-reading the table here returned a different figure
+     * whenever the estimate had moved since submit, and the difference
+     * accumulated: after a gate hold (seconds measured as kernel time, then
+     * corrected) the count stood at ~0.77 s with nothing in flight, and the
+     * throttle held every launch for its 100 ms cap (SGLang: 5 s per token). */
+    double est = p.credit_us;
     pthread_mutex_lock(&g_pmtx);
     g_outstanding_us -= est;
     if (g_outstanding_us < 0) g_outstanding_us = 0;
@@ -425,9 +438,25 @@ static void* tracker_main(void* arg) {
      * See the re-entrancy guard in lithos.h. */
     lithos_internal_begin();
     if (g_track_ctx) cuCtxSetCurrent(g_track_ctx);   /* events are context-bound */
+    /* LITHOS_TRACE_TRACKER=1: the Tracker's state every 2 s (diagnosing a stalled
+     * reap: the throttle waits on the outstanding count only this thread lowers). */
+    int trace = getenv("LITHOS_TRACE_TRACKER") != NULL;
+    uint64_t t_trace = 0, reaped = 0;
     for (;;) {
         int did = 0;
-        while (reap_one()) did = 1;
+        while (reap_one()) { did = 1; reaped++; }
+        if (trace) {
+            uint64_t now = lithos_now_ns();
+            if (now - t_trace > 2000000000ull) {
+                t_trace = now;
+                pthread_mutex_lock(&g_capmtx); int cap = g_capture_active, busy = g_track_busy; pthread_mutex_unlock(&g_capmtx);
+                pthread_mutex_lock(&g_pendmtx); int h = g_pend_head, tl = g_pend_tail; pthread_mutex_unlock(&g_pendmtx);
+                CUresult q = (!cap && h != tl && g_pend[tl].done_evt) ? cuEventQuery(g_pend[tl].done_evt) : (CUresult)-1;  /* never during a capture */
+                fprintf(stderr, "[tracker] captures_open=%d busy=%d outstanding=%.0fus/%d pend=%d head_evt=%d reaped=%lu\n",
+                        cap, busy, predict_outstanding_us(), predict_outstanding_n(), (h - tl + P_PEND) % P_PEND, (int)q,
+                        (unsigned long)reaped);
+            }
+        }
         /* The Tracker is where §5.6's decision belongs: it is the thread that
          * already sees every completion, and a frequency change must not sit on
          * the application's launch path. power_maybe_update rate-limits itself. */

@@ -34,6 +34,7 @@
 #include "atomizer.h"
 #include "qmd.h"
 #include "predict.h"
+#include "gate.h"
 #include "power.h"
 #include "coord.h"
 #include <cuda.h>
@@ -273,14 +274,18 @@ CUresult submit_launch_now(CUfunction f,
             cuEventRecord(ev_start, stream);
     }
 
-    /* (7) Kernel Atomization + dispatch to the GPU (Fig. 9 ③④). */
+    /* (7) Kernel Atomization + dispatch to the GPU (Fig. 9 ③④). A launch held at
+     * the external gate is timed across the hold: release its credit but do not
+     * learn that as its duration. */
+    uint64_t gate_waits0 = lithos_gate_tls_waits;
     int n_atoms = atomizer_dispatch(&k, quota);
+    int learn = lithos_gate_tls_waits == gate_waits0;
 
     /* (6) Mark this launch's COMPLETION with a single event; the Tracker derives
      * the duration from the gap to the previous completion on this queue. */
     if (measure && (ev_done = predict_evt_get())) {
         cuEventRecord(ev_done, stream);
-        predict_submit(slot, op, eff_tpc, n_atoms, ev_start, ev_done);
+        predict_submit(slot, op, eff_tpc, n_atoms, ev_start, ev_done, learn);
     }
 
     postsubmit(stream, n_atoms);
@@ -351,13 +356,15 @@ CUresult submit_launch_ex_now(const CUlaunchConfig* cfg, CUfunction f,
         atomizer_set_ex_atom_cost(0);
     }
 
+    uint64_t gate_waits0 = lithos_gate_tls_waits;         /* see submit_launch_now */
     int n_atoms = atomizer_dispatch_ex(cfg, f, params, extra);
+    int learn = lithos_gate_tls_waits == gate_waits0;
 
     /* One completion event; the Tracker derives the duration from the gap to the
      * previous completion on this queue (see predict.c). */
     if (measure && (ev_done = predict_evt_get())) {
         cuEventRecord(ev_done, cfg->hStream);
-        predict_submit(slot, op, tpcs, n_atoms, ev_start, ev_done);
+        predict_submit(slot, op, tpcs, n_atoms, ev_start, ev_done, learn);
     }
 
     postsubmit(cfg->hStream, n_atoms);

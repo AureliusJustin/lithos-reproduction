@@ -32,6 +32,7 @@ static inline uint64_t lithos_gate_wait(void) {
 }
 
 /* counters for LITHOS_STATS / tests */
+extern __thread uint64_t lithos_gate_tls_waits;   /* gate waits on the calling thread */
 uint64_t lithos_gate_waits(void);
 uint64_t lithos_gate_waited_ns(void);
 

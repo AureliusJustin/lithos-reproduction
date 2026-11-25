@@ -73,6 +73,7 @@ Everything is configured through environment variables (all defined in
 | `LITHOS_COORD` | 1 | cross-process tenant table; assigns disjoint TPC ranges |
 | `LITHOS_GRAPH_SUBGRAPHS` | 0 | partition CUDA graphs into K schedulable subgraphs |
 | `LITHOS_VERBOSE` / `LITHOS_DIAG` | 0 | logging / why-is-coverage-what-it-is diagnostics |
+| `LITHOS_TRACE_TRACKER` | unset | every 2 s, the predictor Tracker's state (open captures, outstanding work, pending completions): for a throttle that never drains |
 | `LITHOS_GATE` | unset | path of an external admission gate (64-byte shared-memory record, e.g. `/dev/shm/arbiter_gate`): every launch, atom and graph launch of this process waits while the gate is closed (fail open: missing/stale record, or `LITHOS_GATE_MAX_MS`, default 2000). Pair with `LITHOS_ATOMS_INFLIGHT=2 LITHOS_THROTTLE=1` so a closed gate takes effect within an atom. `make test_gate` tests it without a GPU |
 
 ## Repository layout

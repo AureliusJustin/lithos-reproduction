@@ -48,7 +48,7 @@ CUevent predict_evt_get(void);
  * the extra relaunches. Feeding that back unadjusted makes the estimate grow, which
  * splits the kernel further, which grows it again. */
 void    predict_submit(int slot, int op, int tpcs, int n_atoms,
-                       CUevent start_evt, CUevent done_evt);
+                       CUevent start_evt, CUevent done_evt, int learn);   /* learn=0: no duration sample */
 
 /* Outstanding work (§5.3): us of in-flight (submitted-not-yet-reaped) work. */
 double  predict_outstanding_us(void);

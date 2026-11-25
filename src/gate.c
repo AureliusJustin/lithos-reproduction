@@ -76,6 +76,10 @@ static int gate_closed(double now) {
     return g_rec->allow == 0;
 }
 
+/* Gate waits on THIS thread (launch paths compare it around a dispatch: a launch
+ * held at the gate must not teach the predictor that the gate time was kernel time). */
+__thread uint64_t lithos_gate_tls_waits;
+
 uint64_t lithos_gate_wait_slow(void) {
     double t0 = now_s(), t = t0;
     if (!gate_closed(t)) return 0;
@@ -85,6 +89,7 @@ uint64_t lithos_gate_wait_slow(void) {
         t = now_s();
     }
     uint64_t ns = (uint64_t)((t - t0) * 1e9);
+    lithos_gate_tls_waits++;
     __atomic_fetch_add(&g_waits, 1, __ATOMIC_RELAXED);
     __atomic_fetch_add(&g_waited_ns, ns, __ATOMIC_RELAXED);
     return ns;
