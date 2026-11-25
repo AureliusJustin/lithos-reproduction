@@ -482,6 +482,18 @@ CUresult cuGetProcAddress_v2(const char* symbol, void** pfn, int cudaVersion,
     CUresult r = g_real.cuGetProcAddress_v2(symbol, pfn, cudaVersion, flags, st);
     if (r != CUDA_SUCCESS || !pfn) return r;
     if (getenv("LITHOS_TRACE_GPA")) fprintf(stderr, "[gpa] %s\n", symbol);
+    /* The resolver itself. The driver hands callers that ask for CUDA >= 12.0 the
+     * v2 ABI (with the symbolStatus out-parameter). Returning our v1 wrapper to
+     * them drops that argument: the caller then reads a status nobody wrote, and
+     * runtimes that check it fail every later lookup (seen with the CuTe-DSL
+     * runtime that FlashInfer uses inside SGLang: cudaErrorUnknown on its first
+     * kernel; the CUDA runtime bundled with PyTorch does not check it). */
+    if (strcmp(symbol, "cuGetProcAddress") == 0) {
+        *pfn = cudaVersion >= 12000 ? (void*)cuGetProcAddress_v2 : (void*)cuGetProcAddress;
+        LOG("cuGetProcAddress(cuGetProcAddress, %d) -> LithOS resolver %s", cudaVersion,
+            cudaVersion >= 12000 ? "v2" : "v1");
+        return r;
+    }
     for (const struct override* o = overrides; o->name; o++) {
         if (strcmp(symbol, o->name) == 0) {
             *pfn = o->fn;   /* hand the app *our* wrapper */

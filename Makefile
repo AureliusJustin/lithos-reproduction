@@ -42,7 +42,7 @@ $(BUILD)/libcuda.so.1: $(FULL_SRC) src/wrapper.c src/*.h | $(BUILD)
 # ----------------------------------------------------------------------
 #  Tests
 # ----------------------------------------------------------------------
-tests: $(BUILD)/test_interpose $(BUILD)/test_interpose_driver \
+tests: $(BUILD)/test_interpose $(BUILD)/test_interpose_driver $(BUILD)/test_gpa_resolver \
        $(BUILD)/test_atomize_small $(BUILD)/test_atomize_cubin \
        $(BUILD)/test_atomize_runtime $(BUILD)/test_atomize_graph \
        $(BUILD)/atomize_mark.cubin $(BUILD)/atomize_mark.fatbin \
@@ -66,6 +66,8 @@ $(BUILD)/correctness_matrix: tests/correctness/matrix.cu | $(BUILD)
 
 # Driver-API apps (exercise the LD_PRELOAD path)
 $(BUILD)/test_interpose_driver: tests/test_interpose_driver.c | $(BUILD)
+	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
+$(BUILD)/test_gpa_resolver: tests/test_gpa_resolver.c | $(BUILD)
 	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
 $(BUILD)/test_atomize_small: tests/test_atomize_small.c | $(BUILD)
 	$(CC) $< -o $@ -I$(CUDA)/include -L$(CUDA)/lib64 -lcuda
@@ -145,6 +147,9 @@ run_tests: all test_gate
 	LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_interpose_driver
 	@echo "== interposition (CUDA runtime / wrapper) =="
 	LD_LIBRARY_PATH=$(BUILD) $(BUILD)/test_interpose
+	@echo "== resolver ABI: cuGetProcAddress hands CUDA >= 12 callers the v2 resolver (wrapper and LD_PRELOAD) =="
+	LD_LIBRARY_PATH=$(BUILD) $(BUILD)/test_gpa_resolver
+	LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_gpa_resolver
 	@echo "== Kernel Atomizer -- CUBIN (splice: real atoms, fall-through, no transfer) =="
 	LITHOS_ATOM_US=8 LD_PRELOAD=$(BUILD)/liblithos_full.so $(BUILD)/test_atomize_cubin 256 $(BUILD)/atomize_mark.cubin
 	@echo "== Kernel Atomizer -- compressed FATBIN (LZ4-decode + unwrap + splice) =="
